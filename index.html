@@ -318,7 +318,7 @@
         <option value="hd_720p_30fps">720p 초저발열 (30fps)</option>
       </select>
       <select id="micSelect" title="마이크 선택" aria-label="마이크 선택">
-        <option value="off">마이크 끔</option>
+        <option value="off">마이크 끔 (Gemini 호환)</option>
       </select>
       <button id="speakerBtn" type="button">스피커 끔</button>
       <select id="speakerSelect" title="스피커 출력 선택" aria-label="스피커 출력 선택" style="display:none;"></select>
@@ -543,7 +543,7 @@
 
         const offOpt = document.createElement('option');
         offOpt.value = 'off';
-        offOpt.textContent = '마이크 끔 (음소거)';
+        offOpt.textContent = '마이크 끔 (Gemini 호환)';
         micSelect.appendChild(offOpt);
 
         audioInputs.forEach((d, idx) => {
@@ -604,7 +604,7 @@
         if (micId === 'off') {
           speakerEnabled = false;
           syncSpeakerUI();
-          showToast('마이크 꺼짐 (음소거)');
+          showToast('마이크 끔 (Gemini 호환 모드)');
           return;
         }
         try {
