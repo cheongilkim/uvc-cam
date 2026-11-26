@@ -74,19 +74,9 @@ struct CameraItem: Identifiable, Hashable {
     let isExternal: Bool
 }
 
-struct AudioInputItem: Identifiable, Hashable {
-    let id: String
-    let name: String
-    let isExternal: Bool
-}
-
 final class CameraController: NSObject, ObservableObject {
-    static let micOffId = "off"
-
     @Published var cameras: [CameraItem] = []
     @Published var activeCameraId: String?
-    @Published var audioInputs: [AudioInputItem] = []
-    @Published var selectedMicId: String = CameraController.micOffId
     @Published var currentOutputName: String = "스피커"
     @Published var statusLevel: StatusLevel = .warn
     @Published var statusText: String = "UVC 카메라 검색 중..."
@@ -133,9 +123,6 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     private let sessionQueue = DispatchQueue(label: "com.cheongilkim.uvccam.session")
-    private let audioEngine = AVAudioEngine()
-    private var isMonitoringAudio = false
-    private var hasActivatedAudioSession = false
     private var currentInput: AVCaptureDeviceInput?
     private var manualOverride = false
     private var isExternalActive = false
@@ -161,16 +148,13 @@ final class CameraController: NSObject, ObservableObject {
 
     deinit {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
-        deactivateAudioSessionForGemini()
     }
 
     func start() {
         DispatchQueue.main.async {
             UIApplication.shared.isIdleTimerDisabled = true
         }
-        // Keep audio session completely idle so Gemini Live never gets interrupted
-        deactivateAudioSessionForGemini()
-        refreshAudioRoutes()
+        refreshOutputRouteName()
         checkPermissionAndStart()
     }
 
@@ -178,7 +162,6 @@ final class CameraController: NSObject, ObservableObject {
         DispatchQueue.main.async {
             UIApplication.shared.isIdleTimerDisabled = false
         }
-        deactivateAudioSessionForGemini()
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
             if self.session.isRunning {
@@ -210,7 +193,7 @@ final class CameraController: NSObject, ObservableObject {
     func reconnect() {
         manualOverride = false
         showToast("UVC 카메라 재검색 중...")
-        refreshAudioRoutes()
+        refreshOutputRouteName()
         configureAndStart(preferredId: nil)
     }
 
@@ -219,158 +202,13 @@ final class CameraController: NSObject, ObservableObject {
         UIApplication.shared.open(url)
     }
 
-    // MARK: - Audio Input / Output (Gemini Live Safe)
-
-    func selectMicrophone(id: String) {
-        if id == Self.micOffId {
-            selectedMicId = Self.micOffId
-            deactivateAudioSessionForGemini()
-            refreshAudioRoutes()
-            showToast("마이크 끔 (Gemini Live 호환 모드)")
-            return
-        }
-
-        let audioSession = AVAudioSession.sharedInstance()
-        switch audioSession.recordPermission {
-        case .granted:
-            applySelectedMicrophone(id: id)
-        case .undetermined:
-            audioSession.requestRecordPermission { [weak self] granted in
-                DispatchQueue.main.async {
-                    guard let self = self else { return }
-                    if granted {
-                        self.applySelectedMicrophone(id: id)
-                    } else {
-                        self.selectedMicId = Self.micOffId
-                        self.deactivateAudioSessionForGemini()
-                        self.showToast("마이크 권한이 필요합니다 (설정에서 허용)")
-                    }
-                }
-            }
-        default:
-            selectedMicId = Self.micOffId
-            deactivateAudioSessionForGemini()
-            showToast("마이크 권한 거부됨 · 설정에서 허용해 주세요")
-        }
-    }
-
-    func refreshAudioRoutes() {
-        let audioSession = AVAudioSession.sharedInstance()
-        var items: [AudioInputItem] = []
-
-        if let ports = audioSession.availableInputs, !ports.isEmpty {
-            items = ports.map { port in
-                let isExt = port.portType == .usbAudio
-                    || port.portType == .bluetoothHFP
-                    || port.portType == .headsetMic
-                    || port.portType == .lineIn
-                return AudioInputItem(id: port.uid, name: port.portName, isExternal: isExt)
-            }
-        } else {
-            // Passive discovery without activating AVAudioSession (.playAndRecord)
-            let audioDiscovery = AVCaptureDevice.DiscoverySession(
-                deviceTypes: [.microphone, .external],
-                mediaType: .audio,
-                position: .unspecified
-            )
-            items = audioDiscovery.devices.map { dev in
-                AudioInputItem(
-                    id: dev.uniqueID,
-                    name: dev.localizedName,
-                    isExternal: dev.deviceType == .external
-                )
-            }
-        }
-
-        let outPort = audioSession.currentRoute.outputs.first
+    /// Passively reads the current system audio output name without touching AVAudioSession.
+    func refreshOutputRouteName() {
+        let outPort = AVAudioSession.sharedInstance().currentRoute.outputs.first
         let outName = outPort?.portName ?? "스피커"
-
         DispatchQueue.main.async {
-            self.audioInputs = items
             self.currentOutputName = outName
-            if self.selectedMicId != Self.micOffId && !items.contains(where: { $0.id == self.selectedMicId }) {
-                self.selectedMicId = Self.micOffId
-                self.deactivateAudioSessionForGemini()
-            }
         }
-    }
-
-    private func deactivateAudioSessionForGemini() {
-        stopAudioMonitor()
-        let audioSession = AVAudioSession.sharedInstance()
-        do {
-            try audioSession.setCategory(.ambient, options: [.mixWithOthers])
-            if hasActivatedAudioSession {
-                try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-                hasActivatedAudioSession = false
-            }
-        } catch {
-            hasActivatedAudioSession = false
-        }
-    }
-
-    private func applySelectedMicrophone(id: String) {
-        let audioSession = AVAudioSession.sharedInstance()
-        do {
-            try audioSession.setCategory(
-                .playAndRecord,
-                mode: .default,
-                options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP, .mixWithOthers]
-            )
-            try audioSession.setActive(true)
-            hasActivatedAudioSession = true
-
-            let desiredName = audioInputs.first(where: { $0.id == id })?.name
-            let targetPort = audioSession.availableInputs?.first(where: { $0.uid == id })
-                ?? audioSession.availableInputs?.first(where: { $0.portName == desiredName })
-
-            if let port = targetPort {
-                try audioSession.setPreferredInput(port)
-                selectedMicId = port.uid
-                startAudioMonitor()
-                refreshAudioRoutes()
-                showToast("마이크 모니터링: \(port.portName)")
-            } else {
-                selectedMicId = Self.micOffId
-                deactivateAudioSessionForGemini()
-                refreshAudioRoutes()
-                showToast("선택한 마이크를 찾을 수 없습니다")
-            }
-        } catch {
-            selectedMicId = Self.micOffId
-            deactivateAudioSessionForGemini()
-            showToast("마이크 연결 실패: \(error.localizedDescription)")
-        }
-    }
-
-    private func startAudioMonitor() {
-        stopAudioMonitor()
-        let input = audioEngine.inputNode
-        let mixer = audioEngine.mainMixerNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            showToast("마이크 오디오 포맷을 열 수 없습니다")
-            return
-        }
-
-        audioEngine.connect(input, to: mixer, format: format)
-        audioEngine.prepare()
-        do {
-            try audioEngine.start()
-            isMonitoringAudio = true
-        } catch {
-            isMonitoringAudio = false
-            showToast("오디오 모니터링 시작 실패")
-        }
-    }
-
-    private func stopAudioMonitor() {
-        if audioEngine.isRunning {
-            audioEngine.stop()
-        }
-        audioEngine.disconnectNodeInput(audioEngine.mainMixerNode)
-        audioEngine.reset()
-        isMonitoringAudio = false
     }
 
     // MARK: - Observers & Camera
@@ -398,7 +236,7 @@ final class CameraController: NSObject, ObservableObject {
         ) { [weak self] _ in
             guard let self = self else { return }
             self.refreshCameraList()
-            self.refreshAudioRoutes()
+            self.refreshOutputRouteName()
             if !self.manualOverride {
                 self.showToast("새 카메라 감지됨")
                 self.configureAndStart(preferredId: nil)
@@ -412,7 +250,7 @@ final class CameraController: NSObject, ObservableObject {
         ) { [weak self] note in
             guard let self = self else { return }
             self.refreshCameraList()
-            self.refreshAudioRoutes()
+            self.refreshOutputRouteName()
             if let dev = note.object as? AVCaptureDevice, dev.uniqueID == self.activeCameraId {
                 self.manualOverride = false
                 self.setStatus(.warn, "카메라 연결 해제 · 재검색 중...")
@@ -425,22 +263,7 @@ final class CameraController: NSObject, ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self = self else { return }
-            self.refreshAudioRoutes()
-            if self.isMonitoringAudio && self.selectedMicId != Self.micOffId && !self.audioEngine.isRunning {
-                self.startAudioMonitor()
-            }
-        })
-
-        observers.append(nc.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: audioEngine,
-            queue: .main
-        ) { [weak self] _ in
-            guard let self = self else { return }
-            if self.isMonitoringAudio && self.selectedMicId != Self.micOffId {
-                self.startAudioMonitor()
-            }
+            self?.refreshOutputRouteName()
         })
 
         observers.append(nc.addObserver(
@@ -450,7 +273,7 @@ final class CameraController: NSObject, ObservableObject {
         ) { [weak self] _ in
             guard let self = self else { return }
             UIApplication.shared.isIdleTimerDisabled = true
-            self.refreshAudioRoutes()
+            self.refreshOutputRouteName()
             self.ensureRunningOrRecover()
         })
 
@@ -569,7 +392,7 @@ final class CameraController: NSObject, ObservableObject {
             self.setStatus(.warn, isExt ? "UVC 연결 중 · \(device.localizedName)" : "카메라 연결 중...")
 
             self.session.beginConfiguration()
-            // Never allow AVCaptureSession to touch AVAudioSession (protects Gemini Live)
+            // Keep video-only session completely decoupled from Bluetooth/Gemini audio routing
             self.session.automaticallyConfiguresApplicationAudioSession = false
             if self.session.canSetSessionPreset(.inputPriority) {
                 self.session.sessionPreset = .inputPriority
@@ -615,7 +438,7 @@ final class CameraController: NSObject, ObservableObject {
                 self.activeFps = fpsVal
                 self.activeCameraId = device.uniqueID
                 self.updateMetaText()
-                self.refreshAudioRoutes()
+                self.refreshOutputRouteName()
                 if isExt {
                     self.setStatus(.live, "UVC 연결됨 · \(device.localizedName)")
                 } else {
@@ -942,45 +765,6 @@ struct ContentView: View {
                     HudChipLabel(text: controller.preset.shortTitle, systemImage: "slider.horizontal.3")
                 }
 
-                Menu {
-                    Button {
-                        controller.selectMicrophone(id: CameraController.micOffId)
-                    } label: {
-                        if controller.selectedMicId == CameraController.micOffId {
-                            Label("마이크 끔 (Gemini Live 사용 시 필수)", systemImage: "checkmark")
-                        } else {
-                            Text("마이크 끔 (Gemini Live 사용 시 필수)")
-                        }
-                    }
-
-                    if !controller.audioInputs.isEmpty {
-                        Divider()
-                        Section("단독 테스트용 모니터링 (켜면 Gemini 음성 중단됨)") {
-                            ForEach(controller.audioInputs) { mic in
-                                Button {
-                                    controller.selectMicrophone(id: mic.id)
-                                } label: {
-                                    let prefix = mic.isExternal ? "[USB/외장] " : "[내장] "
-                                    if mic.id == controller.selectedMicId {
-                                        Label(prefix + mic.name, systemImage: "checkmark")
-                                    } else {
-                                        Text(prefix + mic.name)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } label: {
-                    let activeMicName = controller.selectedMicId == CameraController.micOffId
-                        ? "마이크 끔"
-                        : (controller.audioInputs.first(where: { $0.id == controller.selectedMicId })?.name ?? "마이크")
-                    HudChipLabel(
-                        text: activeMicName,
-                        systemImage: controller.selectedMicId == CameraController.micOffId ? "mic.slash" : "mic.fill",
-                        active: controller.selectedMicId != CameraController.micOffId
-                    )
-                }
-
                 ZStack {
                     HudChipLabel(
                         text: controller.currentOutputName,
@@ -1060,7 +844,6 @@ struct ContentView: View {
 private struct HudChipLabel: View {
     let text: String
     let systemImage: String
-    var active: Bool = false
 
     var body: some View {
         HStack(spacing: 5) {
@@ -1071,16 +854,13 @@ private struct HudChipLabel: View {
                 .lineLimit(1)
                 .frame(maxWidth: 130, alignment: .leading)
         }
-        .foregroundColor(active ? Color(red: 0.85, green: 1.0, blue: 0.88) : .white)
+        .foregroundColor(.white)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(
-            active ? Color.green.opacity(0.32) : Color.white.opacity(0.14),
-            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-        )
+        .background(Color.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(active ? Color.green.opacity(0.7) : Color.white.opacity(0.18), lineWidth: 1)
+                .stroke(Color.white.opacity(0.18), lineWidth: 1)
         )
     }
 }
