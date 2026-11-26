@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Standard USB Video Class (UVC) interfaces -->
+    <usb-device class="14" subclass="1" />
+    <usb-device class="239" subclass="2" />
+    <!-- Realtek UVC Camera (0x0BDA:0x5635) -->
+    <usb-device vendor-id="3034" product-id="22069" />
+</resources>
