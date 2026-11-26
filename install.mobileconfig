@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>FullScreen</key>
+			<true/>
+			<key>IsRemovable</key>
+			<true/>
+			<key>Label</key>
+			<string>UVC Cam</string>
+			<key>PayloadDisplayName</key>
+			<string>UVC Cam 홈 화면 아이콘</string>
+			<key>PayloadIdentifier</key>
+			<string>com.cheongilkim.uvccam.webclip</string>
+			<key>PayloadType</key>
+			<string>com.apple.webClip.managed</string>
+			<key>PayloadUUID</key>
+			<string>B2C3D4E5-F6A7-4890-BCDE-203040506070</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>Precomposed</key>
+			<true/>
+			<key>URL</key>
+			<string>https://cheongilkim.github.io/uvc-cam/</string>
+		</dict>
+	</array>
+	<key>PayloadDescription</key>
+	<string>iPad 홈 화면에 전체화면 UVC Cam 아이콘을 추가합니다.</string>
+	<key>PayloadDisplayName</key>
+	<string>UVC Cam (iPad 홈 화면 앱)</string>
+	<key>PayloadIdentifier</key>
+	<string>com.cheongilkim.uvccam.profile</string>
+	<key>PayloadOrganization</key>
+	<string>UVC Cam</string>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>A1B2C3D4-E5F6-4789-ABCD-102030405060</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+</dict>
+</plist>

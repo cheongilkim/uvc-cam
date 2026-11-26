@@ -1,0 +1,19 @@
+{
+  "name": "UVC Cam",
+  "short_name": "UVC Cam",
+  "description": "iPad용 외장 UVC 카메라 원터치 전체화면 뷰어 (Gemini Live 화면 공유 최적화)",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -1,0 +1,957 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="UVC Cam" />
+  <meta name="theme-color" content="#000000" />
+  <title>UVC Cam</title>
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+  <link rel="apple-touch-icon" href="./icon.svg" />
+  <style>
+    :root {
+      --bg: #000000;
+      --hud-bg: rgba(16, 18, 22, 0.72);
+      --hud-border: rgba(255, 255, 255, 0.16);
+      --text: #f5f7fa;
+      --muted: rgba(245, 247, 250, 0.68);
+      --accent: #32d74b;
+      --warn: #ffd60a;
+      --err: #ff453a;
+      --btn-bg: rgba(255, 255, 255, 0.12);
+      --btn-active: rgba(50, 215, 75, 0.28);
+      --safe-top: env(safe-area-inset-top, 12px);
+      --safe-bottom: env(safe-area-inset-bottom, 12px);
+      --safe-left: env(safe-area-inset-left, 12px);
+      --safe-right: env(safe-area-inset-right, 12px);
+    }
+
+    * {
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Apple SD Gothic Neo", sans-serif;
+    }
+
+    #stage {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100dvh;
+      background: #000;
+      overflow: hidden;
+      cursor: pointer;
+    }
+
+    #camVideo {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      transform-origin: center center;
+      background: #000;
+      pointer-events: none;
+      display: block;
+    }
+
+    /* HUD common transition */
+    .hud {
+      transition: opacity 0.22s ease, transform 0.22s ease;
+      z-index: 20;
+    }
+
+    body.hud-hidden .hud {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    body.hud-hidden #topHud {
+      transform: translateY(-16px);
+    }
+
+    body.hud-hidden #bottomHud {
+      transform: translateY(16px);
+    }
+
+    /* Top Status Pill */
+    #topHud {
+      position: fixed;
+      top: max(12px, var(--safe-top));
+      left: max(14px, var(--safe-left));
+      right: max(14px, var(--safe-right));
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      pointer-events: none;
+    }
+
+    .status-pill {
+      pointer-events: auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 13px;
+      border-radius: 999px;
+      background: var(--hud-bg);
+      border: 1px solid var(--hud-border);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      max-width: 100%;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--warn);
+      flex-shrink: 0;
+      box-shadow: 0 0 8px currentColor;
+    }
+
+    .dot.live { background: var(--accent); color: var(--accent); }
+    .dot.warn { background: var(--warn); color: var(--warn); }
+    .dot.err  { background: var(--err); color: var(--err); }
+
+    #statusText {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    #metaPill {
+      font-variant-numeric: tabular-nums;
+      color: var(--muted);
+      font-weight: 500;
+      font-size: 12px;
+      flex-shrink: 0;
+    }
+
+    /* Bottom Controls */
+    #bottomHud {
+      position: fixed;
+      bottom: max(14px, var(--safe-bottom));
+      left: max(14px, var(--safe-left));
+      right: max(14px, var(--safe-right));
+      display: flex;
+      justify-content: center;
+      pointer-events: none;
+    }
+
+    .control-bar {
+      pointer-events: auto;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border-radius: 20px;
+      background: var(--hud-bg);
+      border: 1px solid var(--hud-border);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+      max-width: 100%;
+    }
+
+    select, button {
+      appearance: none;
+      -webkit-appearance: none;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      background: var(--btn-bg);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      border-radius: 12px;
+      padding: 8px 12px;
+      min-height: 36px;
+      cursor: pointer;
+      outline: none;
+      transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+    }
+
+    select {
+      padding-right: 28px;
+      max-width: 210px;
+      text-overflow: ellipsis;
+      background-image: linear-gradient(45deg, transparent 50%, #ccc 50%),
+                        linear-gradient(135deg, #ccc 50%, transparent 50%);
+      background-position: calc(100% - 14px) 15px, calc(100% - 9px) 15px;
+      background-size: 5px 5px, 5px 5px;
+      background-repeat: no-repeat;
+    }
+
+    button:active {
+      transform: scale(0.96);
+    }
+
+    button.active {
+      background: var(--btn-active);
+      border-color: rgba(50, 215, 75, 0.65);
+      color: #d8ffe0;
+    }
+
+    button.primary {
+      background: rgba(10, 132, 255, 0.35);
+      border-color: rgba(10, 132, 255, 0.7);
+    }
+
+    /* Empty / Permission / Error Overlay */
+    #overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 30;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(0, 0, 0, 0.82);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+    }
+
+    #overlay.visible {
+      display: flex;
+    }
+
+    .overlay-card {
+      width: 100%;
+      max-width: 440px;
+      padding: 24px;
+      border-radius: 22px;
+      background: rgba(24, 26, 32, 0.94);
+      border: 1px solid var(--hud-border);
+      text-align: center;
+    }
+
+    .overlay-card h2 {
+      margin: 0 0 10px;
+      font-size: 19px;
+      font-weight: 700;
+    }
+
+    .overlay-card p {
+      margin: 0 0 18px;
+      font-size: 14px;
+      line-height: 1.55;
+      color: var(--muted);
+      white-space: pre-line;
+    }
+
+    .overlay-actions {
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .overlay-actions button {
+      padding: 11px 18px;
+      font-size: 14px;
+      min-height: 42px;
+    }
+
+    /* Toast feedback */
+    #toast {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) scale(0.96);
+      z-index: 40;
+      padding: 10px 16px;
+      border-radius: 14px;
+      background: rgba(20, 22, 28, 0.88);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.18s ease, transform 0.18s ease;
+    }
+
+    #toast.show {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+  </style>
+</head>
+<body>
+  <div id="stage" aria-label="카메라 화면 (터치하여 메뉴 숨김/표시)">
+    <video id="camVideo" autoplay playsinline muted></video>
+  </div>
+
+  <div id="topHud" class="hud">
+    <div class="status-pill">
+      <span id="statusDot" class="dot warn"></span>
+      <span id="statusText">UVC 카메라 검색 중...</span>
+    </div>
+    <div id="metaPill" class="status-pill">대기</div>
+  </div>
+
+  <div id="bottomHud" class="hud">
+    <div class="control-bar" id="controlBar">
+      <select id="cameraSelect" title="카메라 선택" aria-label="카메라 선택"></select>
+      <select id="presetSelect" title="해상도 및 프레임 프리셋" aria-label="해상도 프리셋">
+        <option value="reading_1080p_10fps">1080p 독서·저발열 (10fps)</option>
+        <option value="uhd_4k">4K 초고화질 (2160p)</option>
+        <option value="fhd_1080p_30fps">1080p 부드럽게 (30fps)</option>
+        <option value="hd_720p_30fps">720p 초저발열 (30fps)</option>
+      </select>
+      <button id="rotateBtn" type="button">회전 0°</button>
+      <button id="mirrorBtn" type="button">좌우반전</button>
+      <button id="fitBtn" type="button">전체보기</button>
+      <button id="pipBtn" type="button">PIP</button>
+      <button id="installBtn" type="button">앱설치</button>
+      <button id="reconnectBtn" type="button" class="primary">재연결</button>
+    </div>
+  </div>
+
+  <div id="overlay">
+    <div class="overlay-card">
+      <h2 id="overlayTitle">UVC 카메라 연결</h2>
+      <p id="overlayDesc">USB-C 포트에 UVC 카메라를 연결한 뒤 아래 버튼을 눌러 카메라 권한을 허용해 주세요.</p>
+      <div class="overlay-actions">
+        <button id="overlayStartBtn" type="button" class="primary">카메라 연결 시작</button>
+        <button id="overlayHideBtn" type="button">닫기</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <script>
+    (() => {
+      'use strict';
+
+      const STORAGE_KEY = 'uvc_cam_ipad_prefs_v1';
+      const PRESETS = {
+        reading_1080p_10fps: { label: '1080p 10fps', width: 1920, height: 1080, fps: 10 },
+        uhd_4k:              { label: '4K 2160p',    width: 3840, height: 2160, fps: 30 },
+        fhd_1080p_30fps:     { label: '1080p 30fps', width: 1920, height: 1080, fps: 30 },
+        hd_720p_30fps:       { label: '720p 30fps',  width: 1280, height: 720,  fps: 30 }
+      };
+
+      const BUILTIN_REGEX = /\b(front|back|rear|truedepth|ultra\s*wide|wide\s*angle|telephoto|desk\s*view|built-in|facetime|ipad|iphone)\b|전면|후면|초광각|망원/i;
+      const EXTERNAL_HINT_REGEX = /\b(usb|uvc|capture|hdmi|webcam|arducam|elp|svpro|external|camera\s*adapter|dongle)\b|외장/i;
+
+      const stage = document.getElementById('stage');
+      const video = document.getElementById('camVideo');
+      const statusDot = document.getElementById('statusDot');
+      const statusText = document.getElementById('statusText');
+      const metaPill = document.getElementById('metaPill');
+      const cameraSelect = document.getElementById('cameraSelect');
+      const presetSelect = document.getElementById('presetSelect');
+      const rotateBtn = document.getElementById('rotateBtn');
+      const mirrorBtn = document.getElementById('mirrorBtn');
+      const fitBtn = document.getElementById('fitBtn');
+      const pipBtn = document.getElementById('pipBtn');
+      const installBtn = document.getElementById('installBtn');
+      const reconnectBtn = document.getElementById('reconnectBtn');
+      const controlBar = document.getElementById('controlBar');
+      const topHud = document.getElementById('topHud');
+      const overlay = document.getElementById('overlay');
+      const overlayTitle = document.getElementById('overlayTitle');
+      const overlayDesc = document.getElementById('overlayDesc');
+      const overlayStartBtn = document.getElementById('overlayStartBtn');
+      const overlayHideBtn = document.getElementById('overlayHideBtn');
+      const toastEl = document.getElementById('toast');
+
+      const defaultPrefs = {
+        preset: 'reading_1080p_10fps',
+        rotation: 0,
+        mirrored: false,
+        fitMode: 'contain',
+        preferredDeviceId: null
+      };
+
+      let prefs = loadPrefs();
+      let currentStream = null;
+      let activeDeviceId = null;
+      let activeIsExternal = false;
+      let isStarting = false;
+      let manualDeviceOverride = false;
+      let wakeLock = null;
+      let toastTimer = null;
+      let deviceChangeTimer = null;
+      let lastFrameTickMs = 0;
+      let fpsFrameCount = 0;
+      let fpsWindowStart = 0;
+      let measuredFps = 0;
+      let lastMediaTime = -1;
+      let stallMs = 0;
+
+      // Audio suppression guaranteed
+      video.muted = true;
+      video.defaultMuted = true;
+      video.volume = 0;
+
+      function loadPrefs() {
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (!raw) return { ...defaultPrefs };
+          const parsed = JSON.parse(raw);
+          return {
+            preset: PRESETS[parsed.preset] ? parsed.preset : defaultPrefs.preset,
+            rotation: [0, 90, 180, 270].includes(parsed.rotation) ? parsed.rotation : 0,
+            mirrored: Boolean(parsed.mirrored),
+            fitMode: parsed.fitMode === 'cover' ? 'cover' : 'contain',
+            preferredDeviceId: typeof parsed.preferredDeviceId === 'string' ? parsed.preferredDeviceId : null
+          };
+        } catch {
+          return { ...defaultPrefs };
+        }
+      }
+
+      function savePrefs() {
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
+        } catch {}
+      }
+
+      function showToast(msg) {
+        toastEl.textContent = msg;
+        toastEl.classList.add('show');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1800);
+      }
+
+      function setStatus(state, text) {
+        statusDot.className = 'dot ' + state;
+        statusText.textContent = text;
+      }
+
+      function showOverlay(title, desc) {
+        overlayTitle.textContent = title;
+        overlayDesc.textContent = desc;
+        overlay.classList.add('visible');
+      }
+
+      function hideOverlay() {
+        overlay.classList.remove('visible');
+      }
+
+      function classifyCamera(device) {
+        const label = (device.label || '').trim();
+        if (!label) return { external: false, priority: 1, label: '카메라' };
+        if (BUILTIN_REGEX.test(label)) {
+          const isBack = /back|rear|후면/i.test(label);
+          return { external: false, priority: isBack ? 2 : 1, label };
+        }
+        if (EXTERNAL_HINT_REGEX.test(label)) {
+          return { external: true, priority: 100, label };
+        }
+        return { external: true, priority: 80, label };
+      }
+
+      function pickBestCamera(devices) {
+        const videoInputs = devices.filter(d => d.kind === 'videoinput');
+        if (videoInputs.length === 0) return null;
+
+        // If user manually chose a specific camera that is still plugged in, respect it
+        if (manualDeviceOverride && prefs.preferredDeviceId) {
+          const matched = videoInputs.find(d => d.deviceId === prefs.preferredDeviceId);
+          if (matched) return { device: matched, ...classifyCamera(matched) };
+        }
+
+        const classified = videoInputs.map(d => ({ device: d, ...classifyCamera(d) }));
+        // Always prioritize external UVC cameras first
+        const externals = classified.filter(c => c.external);
+        if (externals.length > 0) {
+          if (prefs.preferredDeviceId) {
+            const prefExt = externals.find(c => c.device.deviceId === prefs.preferredDeviceId);
+            if (prefExt) return prefExt;
+          }
+          externals.sort((a, b) => b.priority - a.priority);
+          return externals[0];
+        }
+
+        // No external camera identified yet -> check saved preference or fallback to back camera
+        if (prefs.preferredDeviceId) {
+          const pref = classified.find(c => c.device.deviceId === prefs.preferredDeviceId);
+          if (pref) return pref;
+        }
+        classified.sort((a, b) => b.priority - a.priority);
+        return classified[0];
+      }
+
+      async function refreshCameraList() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return [];
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoInputs = devices.filter(d => d.kind === 'videoinput');
+
+        cameraSelect.innerHTML = '';
+        if (videoInputs.length === 0) {
+          const opt = document.createElement('option');
+          opt.value = '';
+          opt.textContent = '연결된 카메라 없음';
+          cameraSelect.appendChild(opt);
+          return [];
+        }
+
+        videoInputs.forEach((d, idx) => {
+          const info = classifyCamera(d);
+          const opt = document.createElement('option');
+          opt.value = d.deviceId;
+          const prefix = info.external ? '[UVC] ' : (d.label ? '[내장] ' : '');
+          opt.textContent = `${prefix}${d.label || `카메라 ${idx + 1}`}`;
+          if (d.deviceId && d.deviceId === activeDeviceId) {
+            opt.selected = true;
+          }
+          cameraSelect.appendChild(opt);
+        });
+
+        return videoInputs;
+      }
+
+      function applyVideoLayout() {
+        const cw = stage.clientWidth || window.innerWidth;
+        const ch = stage.clientHeight || window.innerHeight;
+        const vw = video.videoWidth || 1920;
+        const vh = video.videoHeight || 1080;
+
+        const isQuarterTurn = prefs.rotation === 90 || prefs.rotation === 270;
+        const targetW = isQuarterTurn ? vh : vw;
+        const targetH = isQuarterTurn ? vw : vh;
+
+        const scale = prefs.fitMode === 'cover'
+          ? Math.max(cw / targetW, ch / targetH)
+          : Math.min(cw / targetW, ch / targetH);
+
+        const drawW = Math.round(vw * scale);
+        const drawH = Math.round(vh * scale);
+
+        video.style.width = `${drawW}px`;
+        video.style.height = `${drawH}px`;
+        video.style.objectFit = 'fill';
+
+        const scaleX = prefs.mirrored ? 'scaleX(-1)' : '';
+        video.style.transform = `translate(-50%, -50%) rotate(${prefs.rotation}deg) ${scaleX}`;
+        updateMetaPill();
+      }
+
+      function syncButtonsUI() {
+        presetSelect.value = prefs.preset;
+        rotateBtn.textContent = `회전 ${prefs.rotation}°`;
+        rotateBtn.classList.toggle('active', prefs.rotation !== 0);
+        mirrorBtn.classList.toggle('active', prefs.mirrored);
+        fitBtn.textContent = prefs.fitMode === 'cover' ? '꽉채우기' : '전체보기';
+        fitBtn.classList.toggle('active', prefs.fitMode === 'cover');
+      }
+
+      function updateMetaPill() {
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        if (!vw || !vh) {
+          metaPill.textContent = `회전 ${prefs.rotation}°`;
+          return;
+        }
+        const track = currentStream && currentStream.getVideoTracks()[0];
+        const settings = track && track.getSettings ? track.getSettings() : {};
+        const fpsVal = measuredFps > 0 ? measuredFps : Math.round(settings.frameRate || 0);
+        const fpsPart = fpsVal > 0 ? ` · ${fpsVal}fps` : '';
+        metaPill.textContent = `${vw}×${vh}${fpsPart} · ${prefs.rotation}°`;
+      }
+
+      function stopCurrentStream() {
+        if (currentStream) {
+          currentStream.getTracks().forEach(t => {
+            try {
+              t.onended = null;
+              t.onmute = null;
+              t.onunmute = null;
+              t.stop();
+            } catch {}
+          });
+          currentStream = null;
+        }
+        if (video.srcObject) {
+          video.srcObject = null;
+        }
+      }
+
+      function buildConstraints(deviceId, presetKey) {
+        const p = PRESETS[presetKey] || PRESETS.reading_1080p_10fps;
+        const videoConstraint = {
+          width: { ideal: p.width },
+          height: { ideal: p.height },
+          frameRate: { ideal: p.fps }
+        };
+        if (deviceId) {
+          videoConstraint.deviceId = { ideal: deviceId };
+        }
+        return {
+          video: videoConstraint,
+          audio: false
+        };
+      }
+
+      async function acquireWakeLock() {
+        if (!('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+        try {
+          if (!wakeLock || wakeLock.released) {
+            wakeLock = await navigator.wakeLock.request('screen');
+          }
+        } catch {}
+      }
+
+      async function startCamera(targetDeviceId = null, reason = 'init') {
+        if (isStarting) return;
+        isStarting = true;
+
+        try {
+          if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            setStatus('err', 'HTTPS 연결 필요');
+            showOverlay(
+              '보안 연결(HTTPS)이 필요합니다',
+              'iPadOS Safari는 보안 정책상 HTTPS 환경에서만 외장 UVC 카메라를 열 수 있습니다.\n\nMac에서 ./start_server.sh 실행 후 https://<맥-IP>:8443 주소로 접속해 주세요.'
+            );
+            return;
+          }
+
+          setStatus('warn', reason === 'reconnect' ? '카메라 재연결 중...' : 'UVC 카메라 연결 중...');
+          stopCurrentStream();
+
+          // First enumerate to see if labels/external cameras are already visible
+          let devices = await navigator.mediaDevices.enumerateDevices();
+          let picked = targetDeviceId
+            ? (() => {
+                const found = devices.find(d => d.kind === 'videoinput' && d.deviceId === targetDeviceId);
+                return found ? { device: found, ...classifyCamera(found) } : null;
+              })()
+            : pickBestCamera(devices);
+
+          const chosenId = picked && picked.device && picked.device.deviceId ? picked.device.deviceId : targetDeviceId;
+          let stream;
+
+          try {
+            stream = await navigator.mediaDevices.getUserMedia(buildConstraints(chosenId, prefs.preset));
+          } catch (firstErr) {
+            // Retry with generic constraints in case preset/deviceId failed
+            stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+          }
+
+          currentStream = stream;
+          video.srcObject = stream;
+          await video.play().catch(() => {});
+
+          // Now permissions are granted -> re-enumerate to inspect true labels!
+          devices = await refreshCameraList();
+          const track = stream.getVideoTracks()[0];
+          const trackSettings = track && track.getSettings ? track.getSettings() : {};
+          activeDeviceId = trackSettings.deviceId || null;
+
+          // If we started without knowing labels and an external UVC camera exists, auto-switch to it!
+          if (!targetDeviceId && !manualDeviceOverride) {
+            const bestAfterPerm = pickBestCamera(devices);
+            if (
+              bestAfterPerm &&
+              bestAfterPerm.external &&
+              bestAfterPerm.device.deviceId &&
+              bestAfterPerm.device.deviceId !== activeDeviceId
+            ) {
+              stopCurrentStream();
+              stream = await navigator.mediaDevices.getUserMedia(
+                buildConstraints(bestAfterPerm.device.deviceId, prefs.preset)
+              );
+              currentStream = stream;
+              video.srcObject = stream;
+              await video.play().catch(() => {});
+              await refreshCameraList();
+            }
+          }
+
+          const finalTrack = currentStream.getVideoTracks()[0];
+          if (finalTrack) {
+            const finalSettings = finalTrack.getSettings ? finalTrack.getSettings() : {};
+            activeDeviceId = finalSettings.deviceId || activeDeviceId;
+            if (activeDeviceId) {
+              cameraSelect.value = activeDeviceId;
+            }
+            const matchedDev = devices.find(d => d.deviceId === activeDeviceId);
+            const info = matchedDev ? classifyCamera(matchedDev) : { external: false, label: finalTrack.label || '카메라' };
+            activeIsExternal = info.external;
+
+            finalTrack.onended = () => {
+              setStatus('err', '카메라 신호 끊김 · 복구 중...');
+              scheduleAutoRecover(450);
+            };
+            finalTrack.onmute = () => {
+              setStatus('warn', '신호 대기 중...');
+            };
+            finalTrack.onunmute = () => {
+              setStatus(activeIsExternal ? 'live' : 'warn', activeIsExternal ? `UVC · ${info.label}` : `내장(UVC 미감지) · ${info.label}`);
+            };
+
+            if (activeIsExternal) {
+              setStatus('live', `UVC 연결됨 · ${info.label}`);
+            } else {
+              setStatus('warn', `UVC 미감지(내장: ${info.label}) · USB 연결 확인`);
+            }
+          }
+
+          lastFrameTickMs = performance.now();
+          stallMs = 0;
+          hideOverlay();
+          applyVideoLayout();
+          acquireWakeLock();
+        } catch (err) {
+          console.error('Camera start failed:', err);
+          const msg = err && err.name ? `${err.name}: ${err.message}` : String(err);
+          setStatus('err', '카메라 연결 실패');
+          showOverlay(
+            '카메라를 열 수 없습니다',
+            `오류: ${msg}\n\n1. iPad USB-C 포트에 UVC 카메라가 꽂혀 있는지 확인하세요.\n2. Safari 카메라 접근 권한을 '허용'으로 선택해 주세요.`
+          );
+        } finally {
+          isStarting = false;
+        }
+      }
+
+      let recoverTimer = null;
+      function scheduleAutoRecover(delayMs = 500) {
+        clearTimeout(recoverTimer);
+        recoverTimer = setTimeout(() => {
+          if (document.visibilityState === 'visible' && !isStarting) {
+            startCamera(manualDeviceOverride ? activeDeviceId : null, 'reconnect');
+          }
+        }, delayMs);
+      }
+
+      // Frame callback for accurate live FPS & stall detection
+      function trackFrames() {
+        if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+          const onFrame = (now) => {
+            lastFrameTickMs = now;
+            stallMs = 0;
+            if (fpsWindowStart === 0) fpsWindowStart = now;
+            fpsFrameCount += 1;
+            const elapsed = now - fpsWindowStart;
+            if (elapsed >= 1000) {
+              measuredFps = Math.round((fpsFrameCount * 1000) / elapsed);
+              fpsFrameCount = 0;
+              fpsWindowStart = now;
+              updateMetaPill();
+            }
+            video.requestVideoFrameCallback(onFrame);
+          };
+          video.requestVideoFrameCallback(onFrame);
+        }
+      }
+
+      // Self-healing Watchdog (every 2 seconds)
+      setInterval(() => {
+        if (document.visibilityState !== 'visible' || isStarting || overlay.classList.contains('visible')) {
+          return;
+        }
+        const track = currentStream && currentStream.getVideoTracks()[0];
+        if (!track || track.readyState !== 'live') {
+          scheduleAutoRecover(250);
+          return;
+        }
+        if (video.paused) {
+          video.play().catch(() => {});
+        }
+        const now = performance.now();
+        if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+          if (lastFrameTickMs > 0 && now - lastFrameTickMs > 4500) {
+            setStatus('warn', '영상 멈춤 감지 · 자동 복구 중...');
+            lastFrameTickMs = now;
+            scheduleAutoRecover(150);
+          }
+        } else {
+          const ct = video.currentTime;
+          if (ct === lastMediaTime) {
+            stallMs += 2000;
+            if (stallMs >= 5000) {
+              stallMs = 0;
+              scheduleAutoRecover(150);
+            }
+          } else {
+            lastMediaTime = ct;
+            stallMs = 0;
+          }
+        }
+      }, 2000);
+
+      // Tap screen to toggle clean fullscreen (HUD hide/show)
+      stage.addEventListener('click', () => {
+        document.body.classList.toggle('hud-hidden');
+      });
+
+      // Prevent clicks inside HUD controls from toggling HUD
+      controlBar.addEventListener('click', (e) => e.stopPropagation());
+      topHud.addEventListener('click', (e) => e.stopPropagation());
+
+      cameraSelect.addEventListener('change', () => {
+        const chosen = cameraSelect.value;
+        if (!chosen) return;
+        manualDeviceOverride = true;
+        prefs.preferredDeviceId = chosen;
+        savePrefs();
+        startCamera(chosen, 'switch');
+      });
+
+      presetSelect.addEventListener('change', () => {
+        prefs.preset = presetSelect.value;
+        savePrefs();
+        showToast(`화질 설정: ${PRESETS[prefs.preset].label}`);
+        startCamera(manualDeviceOverride ? activeDeviceId : null, 'preset');
+      });
+
+      rotateBtn.addEventListener('click', () => {
+        prefs.rotation = (prefs.rotation + 90) % 360;
+        savePrefs();
+        syncButtonsUI();
+        applyVideoLayout();
+        showToast(`화면 회전 ${prefs.rotation}°`);
+      });
+
+      mirrorBtn.addEventListener('click', () => {
+        prefs.mirrored = !prefs.mirrored;
+        savePrefs();
+        syncButtonsUI();
+        applyVideoLayout();
+        showToast(prefs.mirrored ? '좌우 반전 켜짐' : '좌우 반전 꺼짐');
+      });
+
+      fitBtn.addEventListener('click', () => {
+        prefs.fitMode = prefs.fitMode === 'contain' ? 'cover' : 'contain';
+        savePrefs();
+        syncButtonsUI();
+        applyVideoLayout();
+        showToast(prefs.fitMode === 'cover' ? '꽉 채우기 (Cover)' : '전체 보기 (Contain)');
+      });
+
+      pipBtn.addEventListener('click', async () => {
+        try {
+          if (document.pictureInPictureElement) {
+            await document.exitPictureInPicture();
+            return;
+          }
+          if (typeof video.webkitSupportsPresentationMode === 'function' &&
+              video.webkitSupportsPresentationMode('picture-in-picture')) {
+            const nextMode = video.webkitPresentationMode === 'picture-in-picture' ? 'inline' : 'picture-in-picture';
+            video.webkitSetPresentationMode(nextMode);
+            return;
+          }
+          if (document.pictureInPictureEnabled && typeof video.requestPictureInPicture === 'function') {
+            await video.requestPictureInPicture();
+            return;
+          }
+          showToast('이 환경에서는 Split View / Slide Over를 이용해 주세요');
+        } catch (err) {
+          showToast('PIP 전환 불가: Split View를 이용해 주세요');
+        }
+      });
+
+      reconnectBtn.addEventListener('click', () => {
+        manualDeviceOverride = false;
+        showToast('UVC 카메라 재검색 중...');
+        startCamera(null, 'reconnect');
+      });
+
+      const isStandalone = window.navigator.standalone === true ||
+        (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+      if (isStandalone) {
+        installBtn.style.display = 'none';
+      } else {
+        installBtn.addEventListener('click', () => {
+          showToast('프로파일 다운로드 후 설정에서 설치하세요');
+          window.location.href = './install.mobileconfig';
+        });
+      }
+
+      overlayStartBtn.addEventListener('click', () => {
+        manualDeviceOverride = false;
+        startCamera(null, 'manual');
+      });
+
+      overlayHideBtn.addEventListener('click', () => {
+        hideOverlay();
+      });
+
+      video.addEventListener('loadedmetadata', applyVideoLayout);
+      video.addEventListener('resize', applyVideoLayout);
+      window.addEventListener('resize', applyVideoLayout);
+      window.addEventListener('orientationchange', () => setTimeout(applyVideoLayout, 180));
+
+      // Auto-detect newly plugged/unplugged USB UVC cameras
+      if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+        navigator.mediaDevices.addEventListener('devicechange', () => {
+          clearTimeout(deviceChangeTimer);
+          deviceChangeTimer = setTimeout(async () => {
+            const devices = await refreshCameraList();
+            const best = pickBestCamera(devices);
+            if (!best) {
+              setStatus('err', '연결된 카메라 없음');
+              return;
+            }
+            const track = currentStream && currentStream.getVideoTracks()[0];
+            const trackGone = !track || track.readyState !== 'live';
+            // If an external UVC camera just appeared while we were on built-in, switch automatically!
+            if (trackGone || (best.external && !activeIsExternal) ||
+                (best.external && best.device.deviceId && best.device.deviceId !== activeDeviceId && !manualDeviceOverride)) {
+              manualDeviceOverride = false;
+              showToast(best.external ? `UVC 감지: ${best.label}` : '카메라 변경 감지');
+              startCamera(best.device.deviceId, 'devicechange');
+            }
+          }, 450);
+        });
+      }
+
+      // Recover cleanly after switching back from Gemini app
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+          acquireWakeLock();
+          const track = currentStream && currentStream.getVideoTracks()[0];
+          if (!track || track.readyState !== 'live') {
+            scheduleAutoRecover(200);
+          } else if (video.paused) {
+            video.play().catch(() => scheduleAutoRecover(200));
+          }
+        }
+      });
+
+      window.addEventListener('pageshow', () => {
+        acquireWakeLock();
+        const track = currentStream && currentStream.getVideoTracks()[0];
+        if (!track || track.readyState !== 'live') {
+          scheduleAutoRecover(250);
+        }
+      });
+
+      window.addEventListener('focus', () => {
+        acquireWakeLock();
+      });
+
+      // Register Service Worker for offline / Home Screen PWA support
+      if ('serviceWorker' in navigator && window.isSecureContext) {
+        navigator.serviceWorker.register('./sw.js').catch(() => {});
+      }
+
+      syncButtonsUI();
+      trackFrames();
+      startCamera(null, 'init');
+    })();
+  </script>
+</body>
+</html>
