@@ -309,6 +309,8 @@
 
   <div id="bottomHud" class="hud">
     <div class="control-bar" id="controlBar">
+      <button id="photoBtn" type="button">📸 사진</button>
+      <button id="scanBtn" type="button">📄 문서스캔</button>
       <select id="cameraSelect" title="카메라 선택" aria-label="카메라 선택"></select>
       <select id="presetSelect" title="해상도 및 프레임 프리셋" aria-label="해상도 프리셋">
         <option value="reading_1080p_10fps">1080p 독서·저발열 (10fps)</option>
@@ -336,6 +338,22 @@
     </div>
   </div>
 
+  <div id="scanModal" style="display:none; position:fixed; inset:0; z-index:50; background:rgba(0,0,0,0.9); align-items:center; justify-content:center; padding:18px;">
+    <div style="width:100%; max-width:520px; background:#181a20; border:1px solid rgba(255,255,255,0.18); border-radius:20px; padding:16px; display:flex; flex-direction:column; gap:12px; max-height:90dvh;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <strong style="font-size:16px;">문서 스캔 미리보기</strong>
+        <button id="scanCloseBtn" type="button">닫기</button>
+      </div>
+      <img id="scanPreviewImg" alt="스캔 미리보기" style="width:100%; max-height:58dvh; object-fit:contain; background:#000; border-radius:12px;" />
+      <div style="display:flex; gap:8px; justify-content:center; flex-wrap:wrap;">
+        <button id="scanEnhanceBtn" type="button" class="active">고대비 문서</button>
+        <button id="scanBwBtn" type="button">흑백 스캔</button>
+        <button id="scanOrigBtn" type="button">원본</button>
+        <button id="scanSaveBtn" type="button" class="primary">이미지 저장</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast"></div>
 
   <script>
@@ -359,6 +377,15 @@
       const statusText = document.getElementById('statusText');
       const metaPill = document.getElementById('metaPill');
       const cameraSelect = document.getElementById('cameraSelect');
+      const photoBtn = document.getElementById('photoBtn');
+      const scanBtn = document.getElementById('scanBtn');
+      const scanModal = document.getElementById('scanModal');
+      const scanPreviewImg = document.getElementById('scanPreviewImg');
+      const scanEnhanceBtn = document.getElementById('scanEnhanceBtn');
+      const scanBwBtn = document.getElementById('scanBwBtn');
+      const scanOrigBtn = document.getElementById('scanOrigBtn');
+      const scanSaveBtn = document.getElementById('scanSaveBtn');
+      const scanCloseBtn = document.getElementById('scanCloseBtn');
       const presetSelect = document.getElementById('presetSelect');
       const rotateBtn = document.getElementById('rotateBtn');
       const mirrorBtn = document.getElementById('mirrorBtn');
@@ -867,6 +894,87 @@
         manualDeviceOverride = false;
         showToast('UVC 카메라 재검색 중...');
         startCamera(null, 'reconnect');
+      });
+
+      function captureOrientedCanvas(mode = 'original') {
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        if (!vw || !vh) return null;
+
+        const isQuarter = prefs.rotation === 90 || prefs.rotation === 270;
+        const cw = isQuarter ? vh : vw;
+        const ch = isQuarter ? vw : vh;
+
+        const canvas = document.createElement('canvas');
+        canvas.width = cw;
+        canvas.height = ch;
+        const ctx = canvas.getContext('2d');
+
+        ctx.save();
+        ctx.translate(cw / 2, ch / 2);
+        if (prefs.mirrored) ctx.scale(-1, 1);
+        ctx.rotate((prefs.rotation * Math.PI) / 180);
+        if (mode === 'enhance') {
+          ctx.filter = 'contrast(1.32) brightness(1.06) saturate(1.1)';
+        } else if (mode === 'bw') {
+          ctx.filter = 'grayscale(1) contrast(1.65) brightness(1.08)';
+        }
+        ctx.drawImage(video, -vw / 2, -vh / 2, vw, vh);
+        ctx.restore();
+        return canvas;
+      }
+
+      function downloadCanvas(canvas, prefix) {
+        const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const a = document.createElement('a');
+        a.href = canvas.toDataURL('image/jpeg', 0.92);
+        a.download = `${prefix}_${ts}.jpg`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }
+
+      let currentScanMode = 'enhance';
+      function renderWebScan(mode) {
+        currentScanMode = mode;
+        scanEnhanceBtn.classList.toggle('active', mode === 'enhance');
+        scanBwBtn.classList.toggle('active', mode === 'bw');
+        scanOrigBtn.classList.toggle('active', mode === 'original');
+        const c = captureOrientedCanvas(mode);
+        if (c) {
+          scanPreviewImg.src = c.toDataURL('image/jpeg', 0.92);
+        }
+      }
+
+      photoBtn.addEventListener('click', () => {
+        const c = captureOrientedCanvas('original');
+        if (!c) {
+          showToast('카메라 프레임을 기다리는 중입니다');
+          return;
+        }
+        downloadCanvas(c, 'UVC_Photo');
+        showToast('📸 사진이 저장되었습니다');
+      });
+
+      scanBtn.addEventListener('click', () => {
+        if (!video.videoWidth) {
+          showToast('카메라 프레임을 기다리는 중입니다');
+          return;
+        }
+        renderWebScan('enhance');
+        scanModal.style.display = 'flex';
+      });
+
+      scanEnhanceBtn.addEventListener('click', () => renderWebScan('enhance'));
+      scanBwBtn.addEventListener('click', () => renderWebScan('bw'));
+      scanOrigBtn.addEventListener('click', () => renderWebScan('original'));
+      scanCloseBtn.addEventListener('click', () => { scanModal.style.display = 'none'; });
+      scanSaveBtn.addEventListener('click', () => {
+        const c = captureOrientedCanvas(currentScanMode);
+        if (c) {
+          downloadCanvas(c, 'UVC_Scan');
+          showToast('📄 스캔 이미지가 저장되었습니다');
+        }
       });
 
       const isStandalone = window.navigator.standalone === true ||

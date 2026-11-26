@@ -1,8 +1,13 @@
 import SwiftUI
 import AVFoundation
 import AVKit
+import CoreImage
 import CoreMedia
+import ImageIO
+import PDFKit
+import Photos
 import UIKit
+import Vision
 
 enum CameraPreset: String, CaseIterable, Identifiable {
     case reading1080p10 = "reading_1080p_10fps"
@@ -54,6 +59,14 @@ enum CameraPreset: String, CaseIterable, Identifiable {
     }
 }
 
+enum ScanFilter: String, CaseIterable, Identifiable {
+    case enhancedColor = "선명한 컬러"
+    case blackAndWhite = "흑백 스캔"
+    case original      = "원본"
+
+    var id: String { rawValue }
+}
+
 enum StatusLevel {
     case live
     case warn
@@ -74,7 +87,13 @@ struct CameraItem: Identifiable, Hashable {
     let isExternal: Bool
 }
 
-final class CameraController: NSObject, ObservableObject {
+struct ScanDraft {
+    let fullCI: CIImage
+    let croppedCI: CIImage?
+    var hasDetectedQuad: Bool { croppedCI != nil }
+}
+
+final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var cameras: [CameraItem] = []
     @Published var activeCameraId: String?
     @Published var currentOutputName: String = "스피커"
@@ -83,6 +102,19 @@ final class CameraController: NSObject, ObservableObject {
     @Published var metaText: String = "대기"
     @Published var needsPermissionSettings: Bool = false
     @Published var toastMessage: String?
+    @Published var shutterFlash: Bool = false
+
+    // Document scan state
+    @Published var showScanSheet: Bool = false
+    @Published var scanImage: UIImage?
+    @Published var scanHasQuad: Bool = false
+    @Published var scanUseCrop: Bool = true {
+        didSet { updateRenderedScanImage() }
+    }
+    @Published var scanFilter: ScanFilter = .enhancedColor {
+        didSet { updateRenderedScanImage() }
+    }
+    @Published var pdfPages: [UIImage] = []
 
     @Published var preset: CameraPreset {
         didSet {
@@ -123,6 +155,15 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     private let sessionQueue = DispatchQueue(label: "com.cheongilkim.uvccam.session")
+    private let videoOutputQueue = DispatchQueue(label: "com.cheongilkim.uvccam.videooutput")
+    private let frameLock = NSLock()
+    private var latestPixelBuffer: CVPixelBuffer?
+    private let videoOutput = AVCaptureVideoDataOutput()
+    private var videoOutputAdded = false
+
+    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    private var currentScanDraft: ScanDraft?
+
     private var currentInput: AVCaptureDeviceInput?
     private var manualOverride = false
     private var isExternalActive = false
@@ -202,12 +243,264 @@ final class CameraController: NSObject, ObservableObject {
         UIApplication.shared.open(url)
     }
 
-    /// Passively reads the current system audio output name without touching AVAudioSession.
     func refreshOutputRouteName() {
         let outPort = AVAudioSession.sharedInstance().currentRoute.outputs.first
         let outName = outPort?.portName ?? "스피커"
         DispatchQueue.main.async {
             self.currentOutputName = outName
+        }
+    }
+
+    // MARK: - Frame Capture, Photo & Document Scan
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        frameLock.lock()
+        latestPixelBuffer = pb
+        frameLock.unlock()
+    }
+
+    private func orientedSnapshotCIImage() -> CIImage? {
+        frameLock.lock()
+        let pb = latestPixelBuffer
+        frameLock.unlock()
+        guard let pixelBuffer = pb else { return nil }
+
+        var ci = CIImage(cvPixelBuffer: pixelBuffer)
+        let rotOrientation: CGImagePropertyOrientation
+        switch rotationDegrees {
+        case 90:  rotOrientation = .right
+        case 180: rotOrientation = .down
+        case 270: rotOrientation = .left
+        default:  rotOrientation = .up
+        }
+        if rotOrientation != .up {
+            ci = ci.oriented(rotOrientation)
+        }
+        if mirrored {
+            ci = ci.oriented(.upMirrored)
+        }
+        return ci
+    }
+
+    private func triggerShutterFlash() {
+        DispatchQueue.main.async {
+            self.shutterFlash = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
+                self.shutterFlash = false
+            }
+        }
+    }
+
+    func capturePhoto() {
+        guard let ci = orientedSnapshotCIImage(),
+              let cg = ciContext.createCGImage(ci, from: ci.extent) else {
+            showToast("카메라 프레임 대기 중입니다")
+            return
+        }
+        triggerShutterFlash()
+        let uiImage = UIImage(cgImage: cg)
+        saveImageToPhotos(uiImage, successToast: "📸 사진이 사진첩에 저장되었습니다")
+    }
+
+    func scanDocument() {
+        guard let ci = orientedSnapshotCIImage() else {
+            showToast("카메라 프레임 대기 중입니다")
+            return
+        }
+        triggerShutterFlash()
+        showToast("문서 테두리 인식 중...")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let cropped = self.detectAndWarpDocument(in: ci)
+            let draft = ScanDraft(fullCI: ci, croppedCI: cropped)
+            DispatchQueue.main.async {
+                self.currentScanDraft = draft
+                self.scanHasQuad = draft.hasDetectedQuad
+                self.scanUseCrop = draft.hasDetectedQuad
+                self.scanFilter = .enhancedColor
+                self.updateRenderedScanImage()
+                self.showScanSheet = true
+            }
+        }
+    }
+
+    private func detectAndWarpDocument(in ci: CIImage) -> CIImage? {
+        let req = VNDetectRectanglesRequest()
+        req.maximumObservations = 1
+        req.minimumAspectRatio = 0.25
+        req.maximumAspectRatio = 1.0
+        req.minimumSize = 0.2
+        req.quadratureTolerance = 35.0
+        req.minimumConfidence = 0.55
+
+        let handler = VNImageRequestHandler(ciImage: ci, options: [:])
+        try? handler.perform([req])
+        guard let obs = req.results?.first else { return nil }
+
+        let ext = ci.extent
+        func toPixel(_ pt: CGPoint) -> CIVector {
+            CIVector(x: ext.origin.x + pt.x * ext.width, y: ext.origin.y + pt.y * ext.height)
+        }
+
+        guard let filter = CIFilter(name: "CIPerspectiveCorrection") else { return nil }
+        filter.setValue(ci, forKey: kCIInputImageKey)
+        filter.setValue(toPixel(obs.topLeft), forKey: "inputTopLeft")
+        filter.setValue(toPixel(obs.topRight), forKey: "inputTopRight")
+        filter.setValue(toPixel(obs.bottomLeft), forKey: "inputBottomLeft")
+        filter.setValue(toPixel(obs.bottomRight), forKey: "inputBottomRight")
+        return filter.outputImage
+    }
+
+    private func applyFilter(_ filterKind: ScanFilter, to input: CIImage) -> CIImage {
+        switch filterKind {
+        case .original:
+            return input
+        case .enhancedColor:
+            var out = input
+            if let cc = CIFilter(name: "CIColorControls") {
+                cc.setValue(out, forKey: kCIInputImageKey)
+                cc.setValue(1.12, forKey: kCIInputSaturationKey)
+                cc.setValue(1.25, forKey: kCIInputContrastKey)
+                cc.setValue(0.04, forKey: kCIInputBrightnessKey)
+                if let img = cc.outputImage { out = img }
+            }
+            if let sh = CIFilter(name: "CISharpenLuminance") {
+                sh.setValue(out, forKey: kCIInputImageKey)
+                sh.setValue(0.65, forKey: kCIInputSharpnessKey)
+                if let img = sh.outputImage { out = img }
+            }
+            return out
+        case .blackAndWhite:
+            var out = input
+            if let cc = CIFilter(name: "CIColorControls") {
+                cc.setValue(out, forKey: kCIInputImageKey)
+                cc.setValue(0.0, forKey: kCIInputSaturationKey)
+                cc.setValue(1.55, forKey: kCIInputContrastKey)
+                cc.setValue(0.06, forKey: kCIInputBrightnessKey)
+                if let img = cc.outputImage { out = img }
+            }
+            if let sh = CIFilter(name: "CISharpenLuminance") {
+                sh.setValue(out, forKey: kCIInputImageKey)
+                sh.setValue(0.8, forKey: kCIInputSharpnessKey)
+                if let img = sh.outputImage { out = img }
+            }
+            return out
+        }
+    }
+
+    private func updateRenderedScanImage() {
+        guard let draft = currentScanDraft else { return }
+        let baseCI = (scanUseCrop && draft.croppedCI != nil) ? draft.croppedCI! : draft.fullCI
+        let filtered = applyFilter(scanFilter, to: baseCI)
+        if let cg = ciContext.createCGImage(filtered, from: filtered.extent) {
+            scanImage = UIImage(cgImage: cg)
+        }
+    }
+
+    func saveCurrentScanToPhotos() {
+        guard let img = scanImage else { return }
+        saveImageToPhotos(img, successToast: "📄 스캔 이미지가 사진첩에 저장되었습니다")
+    }
+
+    func addCurrentScanToPdfBatch() {
+        guard let img = scanImage else { return }
+        pdfPages.append(img)
+        showScanSheet = false
+        showToast("📄 PDF 묶음에 추가됨 (총 \(pdfPages.count)장)")
+    }
+
+    func clearPdfBatch() {
+        pdfPages.removeAll()
+        showToast("PDF 묶음이 초기화되었습니다")
+    }
+
+    func exportPdfBatch(includingCurrentScan: Bool) {
+        var pages = pdfPages
+        if includingCurrentScan, let current = scanImage {
+            pages.append(current)
+        }
+        guard !pages.isEmpty else {
+            showToast("PDF로 만들 스캔 페이지가 없습니다")
+            return
+        }
+
+        let pdfDoc = PDFDocument()
+        for (idx, pageImg) in pages.enumerated() {
+            if let pdfPage = PDFPage(image: pageImg) {
+                pdfDoc.insert(pdfPage, at: idx)
+            }
+        }
+
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyyMMdd_HHmmss"
+        let fileName = "UVC_Scan_\(fmt.string(from: Date())).pdf"
+        let outURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+
+        guard pdfDoc.write(to: outURL) else {
+            showToast("PDF 파일 생성에 실패했습니다")
+            return
+        }
+
+        showScanSheet = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            self.presentShareSheet(items: [outURL])
+        }
+    }
+
+    private func presentShareSheet(items: [Any]) {
+        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+              let rootVC = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController ?? scene.windows.first?.rootViewController else {
+            return
+        }
+        var topVC = rootVC
+        while let presented = topVC.presentedViewController {
+            topVC = presented
+        }
+        let activityVC = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        if let popover = activityVC.popoverPresentationController {
+            popover.sourceView = topVC.view
+            popover.sourceRect = CGRect(
+                x: topVC.view.bounds.midX,
+                y: topVC.view.bounds.midY,
+                width: 1,
+                height: 1
+            )
+            popover.permittedArrowDirections = []
+        }
+        topVC.present(activityVC, animated: true)
+    }
+
+    private func saveImageToPhotos(_ image: UIImage, successToast: String) {
+        let performSave = {
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.creationRequestForAsset(from: image)
+            }) { [weak self] success, error in
+                DispatchQueue.main.async {
+                    if success {
+                        self?.showToast(successToast)
+                    } else {
+                        self?.showToast("저장 실패: \(error?.localizedDescription ?? "권한 확인 필요")")
+                    }
+                }
+            }
+        }
+
+        let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        switch status {
+        case .authorized, .limited:
+            performSave()
+        case .notDetermined:
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { newStatus in
+                if newStatus == .authorized || newStatus == .limited {
+                    performSave()
+                } else {
+                    self.showToast("사진첩 저장 권한이 거부되었습니다")
+                }
+            }
+        default:
+            showToast("iPad 설정에서 UVC Cam의 사진첩 권한을 허용해 주세요")
         }
     }
 
@@ -392,7 +685,6 @@ final class CameraController: NSObject, ObservableObject {
             self.setStatus(.warn, isExt ? "UVC 연결 중 · \(device.localizedName)" : "카메라 연결 중...")
 
             self.session.beginConfiguration()
-            // Keep video-only session completely decoupled from Bluetooth/Gemini audio routing
             self.session.automaticallyConfiguresApplicationAudioSession = false
             if self.session.canSetSessionPreset(.inputPriority) {
                 self.session.sessionPreset = .inputPriority
@@ -421,6 +713,18 @@ final class CameraController: NSObject, ObservableObject {
                 self.session.commitConfiguration()
                 self.setStatus(.error, "카메라 열기 실패: \(error.localizedDescription)")
                 return
+            }
+
+            if !self.videoOutputAdded {
+                self.videoOutput.videoSettings = [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+                ]
+                self.videoOutput.alwaysDiscardsLateVideoFrames = true
+                self.videoOutput.setSampleBufferDelegate(self, queue: self.videoOutputQueue)
+                if self.session.canAddOutput(self.videoOutput) {
+                    self.session.addOutput(self.videoOutput)
+                    self.videoOutputAdded = true
+                }
             }
 
             self.applyFormatAndFps(device: device, preset: targetPreset)
@@ -642,6 +946,89 @@ struct RoutePickerOverlayRepresentable: UIViewRepresentable {
     func updateUIView(_ uiView: FullAreaRoutePickerContainer, context: Context) {}
 }
 
+struct ScanReviewSheet: View {
+    @ObservedObject var controller: CameraController
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 14) {
+                if let img = controller.scanImage {
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.black)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                } else {
+                    Spacer()
+                    ProgressView("스캔 처리 중...")
+                    Spacer()
+                }
+
+                Picker("필터", selection: $controller.scanFilter) {
+                    ForEach(ScanFilter.allCases) { f in
+                        Text(f.rawValue).tag(f)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                if controller.scanHasQuad {
+                    Toggle("자동 테두리 원근 보정", isOn: $controller.scanUseCrop)
+                        .font(.system(size: 14, weight: .semibold))
+                        .padding(.horizontal, 4)
+                }
+
+                HStack(spacing: 10) {
+                    Button {
+                        controller.saveCurrentScanToPhotos()
+                    } label: {
+                        Label("사진첩 저장", systemImage: "photo")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button {
+                        controller.addCurrentScanToPdfBatch()
+                    } label: {
+                        Label("PDF 추가 (\(controller.pdfPages.count)장)", systemImage: "doc.badge.plus")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                HStack(spacing: 10) {
+                    Button {
+                        controller.exportPdfBatch(includingCurrentScan: true)
+                    } label: {
+                        Label("PDF 내보내기 (\(controller.pdfPages.count + 1)장)", systemImage: "square.and.arrow.up")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    if !controller.pdfPages.isEmpty {
+                        Button(role: .destructive) {
+                            controller.clearPdfBatch()
+                        } label: {
+                            Text("초기화")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+            }
+            .padding(16)
+            .navigationTitle("문서 스캔 미리보기")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("닫기") { dismiss() }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
 struct ContentView: View {
     @StateObject private var controller = CameraController()
     @State private var hudHidden = false
@@ -662,6 +1049,12 @@ struct ContentView: View {
                 withAnimation(.easeInOut(duration: 0.2)) {
                     hudHidden.toggle()
                 }
+            }
+
+            if controller.shutterFlash {
+                Color.white.opacity(0.65)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
             }
 
             if !hudHidden {
@@ -695,6 +1088,9 @@ struct ContentView: View {
         }
         .statusBarHidden(hudHidden)
         .persistentSystemOverlays(hudHidden ? .hidden : .automatic)
+        .sheet(isPresented: $controller.showScanSheet) {
+            ScanReviewSheet(controller: controller)
+        }
         .onAppear { controller.start() }
         .onDisappear { controller.stop() }
     }
@@ -718,6 +1114,20 @@ struct ContentView: View {
 
             Spacer()
 
+            if !controller.pdfPages.isEmpty {
+                Button {
+                    controller.exportPdfBatch(includingCurrentScan: false)
+                } label: {
+                    Text("PDF \(controller.pdfPages.count)장")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(Color.blue.opacity(0.65), in: Capsule())
+                        .overlay(Capsule().stroke(Color.blue, lineWidth: 1))
+                }
+            }
+
             Text(controller.metaText)
                 .font(.system(size: 12, weight: .medium).monospacedDigit())
                 .foregroundColor(.white.opacity(0.75))
@@ -731,6 +1141,14 @@ struct ContentView: View {
     private var bottomHud: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
+                Button { controller.capturePhoto() } label: {
+                    HudChipLabel(text: "📸 사진", systemImage: "camera.shutter.button")
+                }
+
+                Button { controller.scanDocument() } label: {
+                    HudChipLabel(text: "📄 문서스캔", systemImage: "doc.viewfinder")
+                }
+
                 Menu {
                     ForEach(controller.cameras) { cam in
                         Button {

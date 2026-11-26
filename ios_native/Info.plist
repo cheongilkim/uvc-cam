@@ -36,6 +36,10 @@
 	<string>17.0</string>
 	<key>NSCameraUsageDescription</key>
 	<string>USB-C 외장 UVC 카메라 및 내장 카메라 영상을 전체화면에 표시하기 위해 카메라 접근 권한이 필요합니다.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>촬영한 사진과 스캔한 문서를 iPad 사진첩에 저장하기 위해 권한이 필요합니다.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>촬영한 사진과 스캔한 문서를 iPad 사진첩에 저장하기 위해 권한이 필요합니다.</string>
 	<key>UIDeviceFamily</key>
 	<array>
 		<integer>1</integer>
