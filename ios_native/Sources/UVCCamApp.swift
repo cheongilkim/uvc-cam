@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import AVKit
 import CoreMedia
 import UIKit
 
@@ -73,9 +74,25 @@ struct CameraItem: Identifiable, Hashable {
     let isExternal: Bool
 }
 
+struct AudioInputItem: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let isExternal: Bool
+}
+
 final class CameraController: NSObject, ObservableObject {
+    static let micOffId = "off"
+
     @Published var cameras: [CameraItem] = []
     @Published var activeCameraId: String?
+    @Published var audioInputs: [AudioInputItem] = []
+    @Published var selectedMicId: String = CameraController.micOffId
+    @Published var forceBuiltinSpeaker: Bool {
+        didSet {
+            UserDefaults.standard.set(forceBuiltinSpeaker, forKey: Keys.forceBuiltinSpeaker)
+        }
+    }
+    @Published var currentOutputName: String = "스피커"
     @Published var statusLevel: StatusLevel = .warn
     @Published var statusText: String = "UVC 카메라 검색 중..."
     @Published var metaText: String = "대기"
@@ -118,9 +135,12 @@ final class CameraController: NSObject, ObservableObject {
         static let rotation = "uvccam_rotation"
         static let mirrored = "uvccam_mirrored"
         static let fillScreen = "uvccam_fill"
+        static let forceBuiltinSpeaker = "uvccam_force_builtin_speaker"
     }
 
     private let sessionQueue = DispatchQueue(label: "com.cheongilkim.uvccam.session")
+    private let audioEngine = AVAudioEngine()
+    private var isMonitoringAudio = false
     private var currentInput: AVCaptureDeviceInput?
     private var manualOverride = false
     private var isExternalActive = false
@@ -139,6 +159,7 @@ final class CameraController: NSObject, ObservableObject {
         self.rotationDegrees = validRot
         self.mirrored = defaults.bool(forKey: Keys.mirrored)
         self.fillScreen = defaults.bool(forKey: Keys.fillScreen)
+        self.forceBuiltinSpeaker = defaults.bool(forKey: Keys.forceBuiltinSpeaker)
 
         super.init()
         setupObservers()
@@ -146,12 +167,14 @@ final class CameraController: NSObject, ObservableObject {
 
     deinit {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
+        stopAudioMonitor()
     }
 
     func start() {
         DispatchQueue.main.async {
             UIApplication.shared.isIdleTimerDisabled = true
         }
+        configureAudioSessionAndRefreshRoutes()
         checkPermissionAndStart()
     }
 
@@ -159,6 +182,7 @@ final class CameraController: NSObject, ObservableObject {
         DispatchQueue.main.async {
             UIApplication.shared.isIdleTimerDisabled = false
         }
+        stopAudioMonitor()
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
             if self.session.isRunning {
@@ -190,6 +214,7 @@ final class CameraController: NSObject, ObservableObject {
     func reconnect() {
         manualOverride = false
         showToast("UVC 카메라 재검색 중...")
+        configureAudioSessionAndRefreshRoutes()
         configureAndStart(preferredId: nil)
     }
 
@@ -197,6 +222,168 @@ final class CameraController: NSObject, ObservableObject {
         guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
         UIApplication.shared.open(url)
     }
+
+    // MARK: - Audio Input / Output Selection
+
+    func selectMicrophone(id: String) {
+        if id == Self.micOffId {
+            selectedMicId = Self.micOffId
+            stopAudioMonitor()
+            refreshAudioRoutes()
+            showToast("마이크 꺼짐 (음소거)")
+            return
+        }
+
+        let audioSession = AVAudioSession.sharedInstance()
+        switch audioSession.recordPermission {
+        case .granted:
+            applySelectedMicrophone(id: id)
+        case .undetermined:
+            audioSession.requestRecordPermission { [weak self] granted in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    if granted {
+                        self.applySelectedMicrophone(id: id)
+                    } else {
+                        self.selectedMicId = Self.micOffId
+                        self.showToast("마이크 권한이 필요합니다 (설정에서 허용)")
+                    }
+                }
+            }
+        default:
+            selectedMicId = Self.micOffId
+            showToast("마이크 권한 거부됨 · 설정에서 허용해 주세요")
+        }
+    }
+
+    func setSpeakerMode(forceBuiltin: Bool) {
+        forceBuiltinSpeaker = forceBuiltin
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+            try audioSession.setCategory(
+                .playAndRecord,
+                mode: .default,
+                options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP, .mixWithOthers]
+            )
+            try audioSession.setActive(true)
+            try audioSession.overrideOutputAudioPort(forceBuiltin ? .speaker : .none)
+            refreshAudioRoutes()
+            showToast(forceBuiltin ? "출력: iPad 내장 스피커" : "출력: USB·외장 장치(자동)")
+        } catch {
+            showToast("스피커 전환 실패: \(error.localizedDescription)")
+        }
+    }
+
+    func refreshAudioRoutes() {
+        let audioSession = AVAudioSession.sharedInstance()
+        let ports = audioSession.availableInputs ?? []
+        let items = ports.map { port in
+            let isExt = port.portType == .usbAudio
+                || port.portType == .bluetoothHFP
+                || port.portType == .headsetMic
+                || port.portType == .lineIn
+            return AudioInputItem(id: port.uid, name: port.portName, isExternal: isExt)
+        }
+
+        let outPort = audioSession.currentRoute.outputs.first
+        let outName: String
+        if forceBuiltinSpeaker {
+            outName = "iPad 스피커"
+        } else if let port = outPort {
+            outName = port.portName
+        } else {
+            outName = "스피커"
+        }
+
+        DispatchQueue.main.async {
+            self.audioInputs = items
+            self.currentOutputName = outName
+            if self.selectedMicId != Self.micOffId && !items.contains(where: { $0.id == self.selectedMicId }) {
+                self.selectedMicId = Self.micOffId
+                self.stopAudioMonitor()
+            }
+        }
+    }
+
+    private func configureAudioSessionAndRefreshRoutes() {
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+            try audioSession.setCategory(
+                .playAndRecord,
+                mode: .default,
+                options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP, .mixWithOthers]
+            )
+            try audioSession.setActive(true)
+            if forceBuiltinSpeaker {
+                try audioSession.overrideOutputAudioPort(.speaker)
+            }
+        } catch {
+            // Audio session may wait for permissions; routes will still refresh below
+        }
+        refreshAudioRoutes()
+    }
+
+    private func applySelectedMicrophone(id: String) {
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+            try audioSession.setCategory(
+                .playAndRecord,
+                mode: .default,
+                options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP, .mixWithOthers]
+            )
+            try audioSession.setActive(true)
+
+            if let targetPort = audioSession.availableInputs?.first(where: { $0.uid == id }) {
+                try audioSession.setPreferredInput(targetPort)
+                try audioSession.overrideOutputAudioPort(forceBuiltinSpeaker ? .speaker : .none)
+                selectedMicId = id
+                startAudioMonitor()
+                refreshAudioRoutes()
+                showToast("마이크: \(targetPort.portName)")
+            } else {
+                selectedMicId = Self.micOffId
+                stopAudioMonitor()
+                refreshAudioRoutes()
+                showToast("선택한 마이크를 찾을 수 없습니다")
+            }
+        } catch {
+            selectedMicId = Self.micOffId
+            stopAudioMonitor()
+            showToast("마이크 연결 실패: \(error.localizedDescription)")
+        }
+    }
+
+    private func startAudioMonitor() {
+        stopAudioMonitor()
+        let input = audioEngine.inputNode
+        let mixer = audioEngine.mainMixerNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            showToast("마이크 오디오 포맷을 열 수 없습니다")
+            return
+        }
+
+        audioEngine.connect(input, to: mixer, format: format)
+        audioEngine.prepare()
+        do {
+            try audioEngine.start()
+            isMonitoringAudio = true
+        } catch {
+            isMonitoringAudio = false
+            showToast("오디오 모니터링 시작 실패")
+        }
+    }
+
+    private func stopAudioMonitor() {
+        if audioEngine.isRunning {
+            audioEngine.stop()
+        }
+        audioEngine.disconnectNodeInput(audioEngine.mainMixerNode)
+        audioEngine.reset()
+        isMonitoringAudio = false
+    }
+
+    // MARK: - Observers & Camera
 
     private func showToast(_ text: String) {
         DispatchQueue.main.async { [weak self] in
@@ -221,6 +408,7 @@ final class CameraController: NSObject, ObservableObject {
         ) { [weak self] _ in
             guard let self = self else { return }
             self.refreshCameraList()
+            self.refreshAudioRoutes()
             if !self.manualOverride {
                 self.showToast("새 카메라 감지됨")
                 self.configureAndStart(preferredId: nil)
@@ -234,10 +422,34 @@ final class CameraController: NSObject, ObservableObject {
         ) { [weak self] note in
             guard let self = self else { return }
             self.refreshCameraList()
+            self.refreshAudioRoutes()
             if let dev = note.object as? AVCaptureDevice, dev.uniqueID == self.activeCameraId {
                 self.manualOverride = false
                 self.setStatus(.warn, "카메라 연결 해제 · 재검색 중...")
                 self.configureAndStart(preferredId: nil)
+            }
+        })
+
+        observers.append(nc.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.refreshAudioRoutes()
+            if self.isMonitoringAudio && self.selectedMicId != Self.micOffId && !self.audioEngine.isRunning {
+                self.startAudioMonitor()
+            }
+        })
+
+        observers.append(nc.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: audioEngine,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            if self.isMonitoringAudio && self.selectedMicId != Self.micOffId {
+                self.startAudioMonitor()
             }
         })
 
@@ -248,6 +460,7 @@ final class CameraController: NSObject, ObservableObject {
         ) { [weak self] _ in
             guard let self = self else { return }
             UIApplication.shared.isIdleTimerDisabled = true
+            self.refreshAudioRoutes()
             self.ensureRunningOrRecover()
         })
 
@@ -324,11 +537,9 @@ final class CameraController: NSObject, ObservableObject {
            let matched = devices.first(where: { $0.uniqueID == preferredId }) {
             return matched
         }
-        // Prioritize USB-C external UVC camera
         if let external = devices.first(where: { $0.deviceType == .external }) {
             return external
         }
-        // Fallback to back built-in camera
         if let back = devices.first(where: { $0.position == .back }) {
             return back
         }
@@ -353,6 +564,7 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     private func configureAndStart(preferredId: String?) {
+        let targetPreset = self.preset
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
 
@@ -367,6 +579,8 @@ final class CameraController: NSObject, ObservableObject {
             self.setStatus(.warn, isExt ? "UVC 연결 중 · \(device.localizedName)" : "카메라 연결 중...")
 
             self.session.beginConfiguration()
+            // Preserve custom AVAudioSession microphone & speaker routing
+            self.session.automaticallyConfiguresApplicationAudioSession = false
             if self.session.canSetSessionPreset(.inputPriority) {
                 self.session.sessionPreset = .inputPriority
             }
@@ -396,7 +610,7 @@ final class CameraController: NSObject, ObservableObject {
                 return
             }
 
-            self.applyFormatAndFps(device: device, preset: self.preset)
+            self.applyFormatAndFps(device: device, preset: targetPreset)
             self.session.commitConfiguration()
 
             if !self.session.isRunning {
@@ -411,6 +625,7 @@ final class CameraController: NSObject, ObservableObject {
                 self.activeFps = fpsVal
                 self.activeCameraId = device.uniqueID
                 self.updateMetaText()
+                self.refreshAudioRoutes()
                 if isExt {
                     self.setStatus(.live, "UVC 연결됨 · \(device.localizedName)")
                 } else {
@@ -442,11 +657,10 @@ final class CameraController: NSObject, ObservableObject {
             device.activeFormat = chosen
 
             let ranges = chosen.videoSupportedFrameRateRanges
-            if let matchingRange = ranges.first(where: { $0.minFrameRate <= targetFPS && targetFPS <= $0.maxFrameRate }) {
+            if let _ = ranges.first(where: { $0.minFrameRate <= targetFPS && targetFPS <= $0.maxFrameRate }) {
                 let duration = CMTime(value: 1, timescale: CMTimeScale(targetFPS))
                 device.activeVideoMinFrameDuration = duration
                 device.activeVideoMaxFrameDuration = duration
-                _ = matchingRange
             } else if let closestRange = ranges.min(by: {
                 abs($0.maxFrameRate - targetFPS) < abs($1.maxFrameRate - targetFPS)
             }) {
@@ -581,6 +795,18 @@ struct CameraPreviewRepresentable: UIViewRepresentable {
     }
 }
 
+struct RoutePickerRepresentable: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView()
+        picker.tintColor = .white
+        picker.activeTintColor = UIColor.systemGreen
+        picker.prioritizesVideoDevices = false
+        return picker
+    }
+
+    func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
+}
+
 struct ContentView: View {
     @StateObject private var controller = CameraController()
     @State private var hudHidden = false
@@ -704,6 +930,79 @@ struct ContentView: View {
                     HudChipLabel(text: controller.preset.shortTitle, systemImage: "slider.horizontal.3")
                 }
 
+                Menu {
+                    Button {
+                        controller.selectMicrophone(id: CameraController.micOffId)
+                    } label: {
+                        if controller.selectedMicId == CameraController.micOffId {
+                            Label("마이크 끔 (음소거)", systemImage: "checkmark")
+                        } else {
+                            Text("마이크 끔 (음소거)")
+                        }
+                    }
+
+                    if !controller.audioInputs.isEmpty {
+                        Divider()
+                        ForEach(controller.audioInputs) { mic in
+                            Button {
+                                controller.selectMicrophone(id: mic.id)
+                            } label: {
+                                let prefix = mic.isExternal ? "[USB/외장] " : "[내장] "
+                                if mic.id == controller.selectedMicId {
+                                    Label(prefix + mic.name, systemImage: "checkmark")
+                                } else {
+                                    Text(prefix + mic.name)
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    let activeMicName = controller.selectedMicId == CameraController.micOffId
+                        ? "마이크 끔"
+                        : (controller.audioInputs.first(where: { $0.id == controller.selectedMicId })?.name ?? "마이크")
+                    HudChipLabel(
+                        text: activeMicName,
+                        systemImage: controller.selectedMicId == CameraController.micOffId ? "mic.slash" : "mic.fill",
+                        active: controller.selectedMicId != CameraController.micOffId
+                    )
+                }
+
+                Menu {
+                    Button {
+                        controller.setSpeakerMode(forceBuiltin: true)
+                    } label: {
+                        if controller.forceBuiltinSpeaker {
+                            Label("iPad 내장 스피커로 출력", systemImage: "checkmark")
+                        } else {
+                            Text("iPad 내장 스피커로 출력")
+                        }
+                    }
+
+                    Button {
+                        controller.setSpeakerMode(forceBuiltin: false)
+                    } label: {
+                        if !controller.forceBuiltinSpeaker {
+                            Label("USB / 외장 장치로 출력 (자동)", systemImage: "checkmark")
+                        } else {
+                            Text("USB / 외장 장치로 출력 (자동)")
+                        }
+                    }
+                } label: {
+                    HudChipLabel(
+                        text: controller.currentOutputName,
+                        systemImage: "speaker.wave.2.fill",
+                        active: controller.forceBuiltinSpeaker
+                    )
+                }
+
+                RoutePickerRepresentable()
+                    .frame(width: 34, height: 34)
+                    .background(Color.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                    )
+
                 Button { controller.rotateStep() } label: {
                     HudButtonLabel(
                         text: "회전 \(controller.rotationDegrees)°",
@@ -774,6 +1073,7 @@ struct ContentView: View {
 private struct HudChipLabel: View {
     let text: String
     let systemImage: String
+    var active: Bool = false
 
     var body: some View {
         HStack(spacing: 5) {
@@ -782,15 +1082,18 @@ private struct HudChipLabel: View {
             Text(text)
                 .font(.system(size: 13, weight: .semibold))
                 .lineLimit(1)
-                .frame(maxWidth: 140, alignment: .leading)
+                .frame(maxWidth: 130, alignment: .leading)
         }
-        .foregroundColor(.white)
+        .foregroundColor(active ? Color(red: 0.85, green: 1.0, blue: 0.88) : .white)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(Color.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background(
+            active ? Color.green.opacity(0.32) : Color.white.opacity(0.14),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                .stroke(active ? Color.green.opacity(0.7) : Color.white.opacity(0.18), lineWidth: 1)
         )
     }
 }

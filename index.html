@@ -297,6 +297,7 @@
 <body>
   <div id="stage" aria-label="카메라 화면 (터치하여 메뉴 숨김/표시)">
     <video id="camVideo" autoplay playsinline muted></video>
+    <audio id="monitorAudio" autoplay playsinline muted style="display:none;"></audio>
   </div>
 
   <div id="topHud" class="hud">
@@ -316,6 +317,11 @@
         <option value="fhd_1080p_30fps">1080p 부드럽게 (30fps)</option>
         <option value="hd_720p_30fps">720p 초저발열 (30fps)</option>
       </select>
+      <select id="micSelect" title="마이크 선택" aria-label="마이크 선택">
+        <option value="off">마이크 끔</option>
+      </select>
+      <button id="speakerBtn" type="button">스피커 끔</button>
+      <select id="speakerSelect" title="스피커 출력 선택" aria-label="스피커 출력 선택" style="display:none;"></select>
       <button id="rotateBtn" type="button">회전 0°</button>
       <button id="mirrorBtn" type="button">좌우반전</button>
       <button id="fitBtn" type="button">전체보기</button>
@@ -355,11 +361,15 @@
 
       const stage = document.getElementById('stage');
       const video = document.getElementById('camVideo');
+      const monitorAudio = document.getElementById('monitorAudio');
       const statusDot = document.getElementById('statusDot');
       const statusText = document.getElementById('statusText');
       const metaPill = document.getElementById('metaPill');
       const cameraSelect = document.getElementById('cameraSelect');
       const presetSelect = document.getElementById('presetSelect');
+      const micSelect = document.getElementById('micSelect');
+      const speakerBtn = document.getElementById('speakerBtn');
+      const speakerSelect = document.getElementById('speakerSelect');
       const rotateBtn = document.getElementById('rotateBtn');
       const mirrorBtn = document.getElementById('mirrorBtn');
       const fitBtn = document.getElementById('fitBtn');
@@ -385,6 +395,9 @@
 
       let prefs = loadPrefs();
       let currentStream = null;
+      let audioStream = null;
+      let selectedMicId = 'off';
+      let speakerEnabled = false;
       let activeDeviceId = null;
       let activeIsExternal = false;
       let isStarting = false;
@@ -519,7 +532,105 @@
           cameraSelect.appendChild(opt);
         });
 
+        refreshAudioLists(devices);
         return videoInputs;
+      }
+
+      function refreshAudioLists(allDevices) {
+        const audioInputs = allDevices.filter(d => d.kind === 'audioinput');
+        const prevMic = selectedMicId;
+        micSelect.innerHTML = '';
+
+        const offOpt = document.createElement('option');
+        offOpt.value = 'off';
+        offOpt.textContent = '마이크 끔 (음소거)';
+        micSelect.appendChild(offOpt);
+
+        audioInputs.forEach((d, idx) => {
+          const opt = document.createElement('option');
+          opt.value = d.deviceId;
+          const label = (d.label || `마이크 ${idx + 1}`).trim();
+          const isExt = EXTERNAL_HINT_REGEX.test(label);
+          opt.textContent = `${isExt ? '[USB/외장] ' : ''}${label}`;
+          micSelect.appendChild(opt);
+        });
+
+        if (Array.from(micSelect.options).some(o => o.value === prevMic)) {
+          micSelect.value = prevMic;
+        } else {
+          selectedMicId = 'off';
+          micSelect.value = 'off';
+        }
+
+        const audioOutputs = allDevices.filter(d => d.kind === 'audiooutput');
+        if (typeof monitorAudio.setSinkId === 'function' && audioOutputs.length > 0) {
+          const prevSink = speakerSelect.value;
+          speakerSelect.innerHTML = '';
+          audioOutputs.forEach((d, idx) => {
+            const opt = document.createElement('option');
+            opt.value = d.deviceId;
+            opt.textContent = `[출력] ${d.label || `스피커 ${idx + 1}`}`;
+            speakerSelect.appendChild(opt);
+          });
+          if (prevSink && Array.from(speakerSelect.options).some(o => o.value === prevSink)) {
+            speakerSelect.value = prevSink;
+          }
+          speakerSelect.style.display = '';
+        } else {
+          speakerSelect.style.display = 'none';
+        }
+      }
+
+      function stopAudioMonitorStream() {
+        if (audioStream) {
+          audioStream.getTracks().forEach(t => {
+            try { t.stop(); } catch {}
+          });
+          audioStream = null;
+        }
+        monitorAudio.srcObject = null;
+      }
+
+      function syncSpeakerUI() {
+        monitorAudio.muted = !speakerEnabled;
+        monitorAudio.volume = speakerEnabled ? 1.0 : 0.0;
+        speakerBtn.textContent = speakerEnabled ? '스피커 켜짐' : '스피커 끔';
+        speakerBtn.classList.toggle('active', speakerEnabled);
+      }
+
+      async function setMicrophoneSelection(micId) {
+        selectedMicId = micId;
+        stopAudioMonitorStream();
+        if (micId === 'off') {
+          speakerEnabled = false;
+          syncSpeakerUI();
+          showToast('마이크 꺼짐 (음소거)');
+          return;
+        }
+        try {
+          audioStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              deviceId: { ideal: micId },
+              echoCancellation: true,
+              noiseSuppression: true
+            },
+            video: false
+          });
+          monitorAudio.srcObject = audioStream;
+          speakerEnabled = true;
+          syncSpeakerUI();
+          await monitorAudio.play().catch(() => {});
+          const allDevs = await navigator.mediaDevices.enumerateDevices();
+          refreshAudioLists(allDevs);
+          const track = audioStream.getAudioTracks()[0];
+          showToast(`마이크 연결: ${(track && track.label) || '선택됨'}`);
+        } catch (err) {
+          selectedMicId = 'off';
+          micSelect.value = 'off';
+          speakerEnabled = false;
+          syncSpeakerUI();
+          showToast('마이크 접근 권한을 확인해 주세요');
+        }
       }
 
       function applyVideoLayout() {
@@ -817,6 +928,34 @@
         startCamera(manualDeviceOverride ? activeDeviceId : null, 'preset');
       });
 
+      micSelect.addEventListener('change', () => {
+        setMicrophoneSelection(micSelect.value);
+      });
+
+      speakerBtn.addEventListener('click', () => {
+        if (selectedMicId === 'off' && !speakerEnabled) {
+          showToast('iPad 제어 센터 AirPlay에서 스피커 출력 장치를 변경할 수 있습니다');
+          return;
+        }
+        speakerEnabled = !speakerEnabled;
+        syncSpeakerUI();
+        if (speakerEnabled) {
+          monitorAudio.play().catch(() => {});
+        }
+        showToast(speakerEnabled ? '스피커 출력 켜짐' : '스피커 출력 꺼짐');
+      });
+
+      speakerSelect.addEventListener('change', async () => {
+        if (typeof monitorAudio.setSinkId === 'function' && speakerSelect.value) {
+          try {
+            await monitorAudio.setSinkId(speakerSelect.value);
+            showToast(`출력 변경: ${speakerSelect.options[speakerSelect.selectedIndex].textContent}`);
+          } catch {
+            showToast('출력 장치를 변경할 수 없습니다');
+          }
+        }
+      });
+
       rotateBtn.addEventListener('click', () => {
         prefs.rotation = (prefs.rotation + 90) % 360;
         savePrefs();
@@ -949,6 +1088,7 @@
       }
 
       syncButtonsUI();
+      syncSpeakerUI();
       trackFrames();
       startCamera(null, 'init');
     })();

@@ -36,6 +36,8 @@
 	<string>17.0</string>
 	<key>NSCameraUsageDescription</key>
 	<string>USB-C 외장 UVC 카메라 및 내장 카메라 영상을 전체화면에 표시하기 위해 카메라 접근 권한이 필요합니다.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>UVC 카메라 또는 iPad 마이크 입력을 선택해 모니터링하거나 오디오 입·출력을 전환하기 위해 마이크 권한이 필요합니다.</string>
 	<key>UIDeviceFamily</key>
 	<array>
 		<integer>1</integer>

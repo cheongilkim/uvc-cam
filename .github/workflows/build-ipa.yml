@@ -103,6 +103,7 @@ jobs:
             -sdk "$SDK_PATH" \
             -framework SwiftUI \
             -framework AVFoundation \
+            -framework AVKit \
             -framework UIKit \
             -framework CoreMedia \
             ios_native/Sources/UVCCamApp.swift \
