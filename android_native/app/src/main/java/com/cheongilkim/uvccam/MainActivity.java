@@ -3,27 +3,44 @@ package com.cheongilkim.uvccam;
 import android.Manifest;
 import android.app.AlertDialog;
 import android.app.PictureInPictureParams;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.ColorMatrix;
+import android.graphics.ColorMatrixColorFilter;
+import android.graphics.ImageFormat;
+import android.graphics.Matrix;
+import android.graphics.Paint;
+import android.graphics.Rect;
+import android.graphics.YuvImage;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.pdf.PdfDocument;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbInterface;
 import android.media.AudioDeviceCallback;
 import android.media.AudioDeviceInfo;
 import android.media.AudioManager;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.MediaStore;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.Rational;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.PixelCopy;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -31,6 +48,7 @@ import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -39,18 +57,28 @@ import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
+import androidx.core.content.FileProvider;
 
 import com.herohan.uvcapp.CameraException;
 import com.herohan.uvcapp.CameraHelper;
 import com.herohan.uvcapp.CameraPreviewConfig;
 import com.herohan.uvcapp.ICameraHelper;
 import com.serenegiant.opengl.renderer.MirrorMode;
+import com.serenegiant.usb.IFrameCallback;
 import com.serenegiant.usb.Size;
 import com.serenegiant.usb.UVCCamera;
 import com.serenegiant.utils.UVCUtils;
 
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity implements SurfaceHolder.Callback {
 
@@ -82,6 +110,22 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         }
     }
 
+    private enum ScanFilter {
+        ENHANCED_COLOR("선명한 컬러"),
+        BLACK_WHITE("흑백 스캔"),
+        ORIGINAL("원본");
+
+        final String label;
+
+        ScanFilter(String label) {
+            this.label = label;
+        }
+    }
+
+    private interface FrameResultCallback {
+        void onBitmapReady(Bitmap bitmap);
+    }
+
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private SharedPreferences prefs;
 
@@ -93,11 +137,13 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private FrameLayout rootLayout;
     private SurfaceView surfaceView;
+    private View shutterOverlay;
     private View topHud;
     private View bottomHud;
     private View statusDot;
     private TextView statusTextView;
     private TextView metaTextView;
+    private Button pdfBadgeBtn;
 
     private Button cameraBtn;
     private Button presetBtn;
@@ -113,6 +159,44 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private int currentCamW = 1920;
     private int currentCamH = 1080;
     private int currentCamFps = 0;
+
+    // Fast-path frame capture state
+    private volatile boolean capturePending = false;
+    private FrameResultCallback pendingFrameCallback = null;
+    private final List<Bitmap> pdfPages = new ArrayList<>();
+
+    private final IFrameCallback frameCallback = new IFrameCallback() {
+        @Override
+        public void onFrame(ByteBuffer frame) {
+            if (!capturePending || frame == null) return;
+            capturePending = false;
+            final FrameResultCallback cb = pendingFrameCallback;
+            pendingFrameCallback = null;
+            if (cb == null) return;
+
+            try {
+                int len = frame.remaining();
+                byte[] nv21 = new byte[len];
+                frame.get(nv21);
+                int w = currentCamW;
+                int h = currentCamH;
+                if (w <= 0 || h <= 0 || len < (w * h)) {
+                    mainHandler.post(() -> cb.onBitmapReady(null));
+                    return;
+                }
+                YuvImage yuv = new YuvImage(nv21, ImageFormat.NV21, w, h, null);
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                yuv.compressToJpeg(new Rect(0, 0, w, h), 94, out);
+                byte[] jpeg = out.toByteArray();
+                Bitmap raw = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length);
+                Bitmap oriented = applyOrientation(raw);
+                if (raw != null && raw != oriented) raw.recycle();
+                mainHandler.post(() -> cb.onBitmapReady(oriented));
+            } catch (Exception e) {
+                mainHandler.post(() -> cb.onBitmapReady(null));
+            }
+        }
+    };
 
     private AudioManager audioManager;
     private final AudioDeviceCallback audioDeviceCallback = new AudioDeviceCallback() {
@@ -156,6 +240,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
                 if (surfaceReady) {
                     cameraHelper.addSurface(surfaceView.getHolder().getSurface(), false);
                 }
+                cameraHelper.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_NV21);
                 cameraHelper.startPreview();
                 previewStarted = true;
             }
@@ -304,6 +389,10 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         if (audioManager != null) {
             audioManager.unregisterAudioDeviceCallback(audioDeviceCallback);
         }
+        for (Bitmap page : pdfPages) {
+            if (page != null && !page.isRecycled()) page.recycle();
+        }
+        pdfPages.clear();
         if (cameraHelper != null) {
             try {
                 cameraHelper.releaseAll();
@@ -355,6 +444,14 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         );
         rootLayout.addView(surfaceView, svLp);
 
+        shutterOverlay = new View(this);
+        shutterOverlay.setBackgroundColor(Color.argb(170, 255, 255, 255));
+        shutterOverlay.setVisibility(View.GONE);
+        rootLayout.addView(shutterOverlay, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+        ));
+
         // Top HUD
         LinearLayout topBar = new LinearLayout(this);
         topBar.setOrientation(LinearLayout.HORIZONTAL);
@@ -383,6 +480,16 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         );
         statusPillLp.rightMargin = dp(8);
         topBar.addView(statusPill, statusPillLp);
+
+        pdfBadgeBtn = makeHudButton("PDF 0장", v -> exportPdfBatch(null));
+        styleHudButton(pdfBadgeBtn, false, true);
+        pdfBadgeBtn.setVisibility(View.GONE);
+        LinearLayout.LayoutParams pdfLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        pdfLp.rightMargin = dp(8);
+        topBar.addView(pdfBadgeBtn, pdfLp);
 
         LinearLayout metaPill = makePillContainer();
         metaTextView = new TextView(this);
@@ -414,9 +521,11 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
 
+        Button photoBtn = makeHudButton("📸 사진", v -> capturePhoto());
+        Button scanBtn = makeHudButton("📄 문서스캔", v -> scanDocument());
         cameraBtn = makeHudButton("카메라", v -> showCameraChooser());
         presetBtn = makeHudButton(activePreset.shortTitle, v -> showPresetChooser());
-        audioBtn = makeHudButton("오디오 출력", v -> openAudioOutputPanel());
+        audioBtn = makeHudButton("폰 스피커", v -> openAudioOutputPanel());
         rotateBtn = makeHudButton("회전 0°", v -> {
             rotationDegrees = (rotationDegrees + 90) % 360;
             savePreferences();
@@ -444,6 +553,8 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         Button reconnectBtn = makeHudButton("재연결", v -> reconnectCamera());
         styleHudButton(reconnectBtn, true, true);
 
+        addControlWithGap(bar, photoBtn, true);
+        addControlWithGap(bar, scanBtn, true);
         addControlWithGap(bar, cameraBtn, true);
         addControlWithGap(bar, presetBtn, true);
         addControlWithGap(bar, audioBtn, true);
@@ -471,6 +582,408 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         setContentView(rootLayout);
         setStatus(StatusKind.WARN, "UVC 카메라 검색 중...");
     }
+
+    // MARK: - Photo Capture & Document Scan (PDF)
+
+    private void triggerShutterFlash() {
+        shutterOverlay.setVisibility(View.VISIBLE);
+        mainHandler.postDelayed(() -> shutterOverlay.setVisibility(View.GONE), 130);
+    }
+
+    private void captureCurrentFrame(FrameResultCallback callback) {
+        if (cameraHelper == null || !cameraHelper.isCameraOpened()) {
+            Toast.makeText(this, "UVC 카메라가 연결되어 있지 않습니다", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        triggerShutterFlash();
+
+        final boolean[] delivered = {false};
+        pendingFrameCallback = bmp -> {
+            if (delivered[0]) return;
+            delivered[0] = true;
+            if (bmp != null) {
+                callback.onBitmapReady(bmp);
+            } else {
+                captureViaPixelCopy(callback);
+            }
+        };
+        capturePending = true;
+
+        // Fallback to PixelCopy if native IFrameCallback doesn't return within 450ms
+        mainHandler.postDelayed(() -> {
+            if (!delivered[0]) {
+                capturePending = false;
+                pendingFrameCallback = null;
+                delivered[0] = true;
+                captureViaPixelCopy(callback);
+            }
+        }, 450);
+    }
+
+    private void captureViaPixelCopy(FrameResultCallback callback) {
+        if (!surfaceReady || surfaceView.getWidth() <= 0 || surfaceView.getHeight() <= 0) {
+            callback.onBitmapReady(null);
+            return;
+        }
+        Bitmap bmp = Bitmap.createBitmap(surfaceView.getWidth(), surfaceView.getHeight(), Bitmap.Config.ARGB_8888);
+        try {
+            PixelCopy.request(surfaceView, bmp, copyResult -> {
+                if (copyResult == PixelCopy.SUCCESS) {
+                    callback.onBitmapReady(bmp);
+                } else {
+                    bmp.recycle();
+                    callback.onBitmapReady(null);
+                }
+            }, mainHandler);
+        } catch (Exception e) {
+            bmp.recycle();
+            callback.onBitmapReady(null);
+        }
+    }
+
+    private Bitmap applyOrientation(Bitmap src) {
+        if (src == null) return null;
+        if (rotationDegrees == 0 && !mirrored) return src;
+        Matrix m = new Matrix();
+        if (rotationDegrees != 0) {
+            m.postRotate(rotationDegrees);
+        }
+        if (mirrored) {
+            m.postScale(-1f, 1f);
+        }
+        return Bitmap.createBitmap(src, 0, 0, src.getWidth(), src.getHeight(), m, true);
+    }
+
+    private void capturePhoto() {
+        captureCurrentFrame(bitmap -> {
+            if (bitmap == null) {
+                Toast.makeText(this, "프레임을 캡처할 수 없습니다", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            boolean saved = saveBitmapToGallery(bitmap, "UVC_Photo");
+            bitmap.recycle();
+            Toast.makeText(
+                    this,
+                    saved ? "📸 사진이 갤러리(Pictures/UVC Cam)에 저장되었습니다" : "사진 저장 실패",
+                    Toast.LENGTH_SHORT
+            ).show();
+        });
+    }
+
+    private void scanDocument() {
+        captureCurrentFrame(fullBitmap -> {
+            if (fullBitmap == null) {
+                Toast.makeText(this, "프레임을 캡처할 수 없습니다", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            Toast.makeText(this, "문서 영역 분석 중...", Toast.LENGTH_SHORT).show();
+            new Thread(() -> {
+                Bitmap autoCropped = detectAndCropDocument(fullBitmap);
+                mainHandler.post(() -> showScanPreviewDialog(fullBitmap, autoCropped));
+            }).start();
+        });
+    }
+
+    /**
+     * Lightweight contrast/edge bounding-region detector for paper/documents on darker desks.
+     * Falls back to null (full frame) if no clear document region is found.
+     */
+    private Bitmap detectAndCropDocument(Bitmap src) {
+        int w = src.getWidth();
+        int h = src.getHeight();
+        int targetW = 180;
+        int targetH = Math.max(1, Math.round((float) h * targetW / w));
+        Bitmap small = Bitmap.createScaledBitmap(src, targetW, targetH, true);
+
+        int[] pixels = new int[targetW * targetH];
+        small.getPixels(pixels, 0, targetW, 0, 0, targetW, targetH);
+        small.recycle();
+
+        int[] lum = new int[pixels.length];
+        long sum = 0;
+        for (int i = 0; i < pixels.length; i++) {
+            int c = pixels[i];
+            int y = (((c >> 16) & 0xff) * 30 + ((c >> 8) & 0xff) * 59 + (c & 0xff) * 11) / 100;
+            lum[i] = y;
+            sum += y;
+        }
+        int avg = (int) (sum / Math.max(1, lum.length));
+        int thresh = Math.min(205, Math.max(95, avg + 18));
+
+        int minX = targetW, minY = targetH, maxX = -1, maxY = -1;
+        int brightCount = 0;
+        for (int y = 2; y < targetH - 2; y++) {
+            for (int x = 2; x < targetW - 2; x++) {
+                int v = lum[y * targetW + x];
+                if (v >= thresh) {
+                    brightCount++;
+                    if (x < minX) minX = x;
+                    if (x > maxX) maxX = x;
+                    if (y < minY) minY = y;
+                    if (y > maxY) maxY = y;
+                }
+            }
+        }
+
+        float coverage = (float) brightCount / (targetW * targetH);
+        if (maxX <= minX || maxY <= minY || coverage < 0.12f || coverage > 0.92f) {
+            return null;
+        }
+
+        int padX = Math.round(targetW * 0.02f);
+        int padY = Math.round(targetH * 0.02f);
+        minX = Math.max(0, minX - padX);
+        minY = Math.max(0, minY - padY);
+        maxX = Math.min(targetW - 1, maxX + padX);
+        maxY = Math.min(targetH - 1, maxY + padY);
+
+        int cropX = Math.round((float) minX * w / targetW);
+        int cropY = Math.round((float) minY * h / targetH);
+        int cropW = Math.min(w - cropX, Math.round((float) (maxX - minX + 1) * w / targetW));
+        int cropH = Math.min(h - cropY, Math.round((float) (maxY - minY + 1) * h / targetH));
+
+        if (cropW < w * 0.25f || cropH < h * 0.25f || (cropW > w * 0.96f && cropH > h * 0.96f)) {
+            return null;
+        }
+        return Bitmap.createBitmap(src, cropX, cropY, cropW, cropH);
+    }
+
+    private Bitmap applyScanFilter(Bitmap src, ScanFilter filter) {
+        if (src == null) return null;
+        if (filter == ScanFilter.ORIGINAL) {
+            return src.copy(Bitmap.Config.ARGB_8888, false);
+        }
+        Bitmap out = Bitmap.createBitmap(src.getWidth(), src.getHeight(), Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(out);
+        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+
+        ColorMatrix cm = new ColorMatrix();
+        if (filter == ScanFilter.BLACK_WHITE) {
+            ColorMatrix gray = new ColorMatrix();
+            gray.setSaturation(0f);
+            float contrast = 1.65f;
+            float translate = (-0.5f * contrast + 0.5f) * 255f + 12f;
+            ColorMatrix cMat = new ColorMatrix(new float[]{
+                    contrast, 0, 0, 0, translate,
+                    0, contrast, 0, 0, translate,
+                    0, 0, contrast, 0, translate,
+                    0, 0, 0, 1, 0
+            });
+            cm.postConcat(gray);
+            cm.postConcat(cMat);
+        } else {
+            float contrast = 1.28f;
+            float translate = (-0.5f * contrast + 0.5f) * 255f + 8f;
+            cm.set(new float[]{
+                    contrast, 0, 0, 0, translate,
+                    0, contrast, 0, 0, translate,
+                    0, 0, contrast, 0, translate,
+                    0, 0, 0, 1, 0
+            });
+        }
+        paint.setColorFilter(new ColorMatrixColorFilter(cm));
+        canvas.drawBitmap(src, 0, 0, paint);
+        return out;
+    }
+
+    private void showScanPreviewDialog(Bitmap fullBitmap, Bitmap autoCropped) {
+        final ScanFilter[] currentFilter = {ScanFilter.ENHANCED_COLOR};
+        final boolean[] useCrop = {autoCropped != null};
+        final Bitmap[] rendered = {null};
+
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setPadding(dp(16), dp(12), dp(16), dp(12));
+
+        ImageView previewImg = new ImageView(this);
+        previewImg.setBackgroundColor(Color.BLACK);
+        previewImg.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        LinearLayout.LayoutParams imgLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(300)
+        );
+        imgLp.bottomMargin = dp(10);
+        container.addView(previewImg, imgLp);
+
+        LinearLayout filterRow = new LinearLayout(this);
+        filterRow.setOrientation(LinearLayout.HORIZONTAL);
+        filterRow.setGravity(Gravity.CENTER);
+
+        Button colorBtn = makeHudButton(ScanFilter.ENHANCED_COLOR.label, null);
+        Button bwBtn = makeHudButton(ScanFilter.BLACK_WHITE.label, null);
+        Button origBtn = makeHudButton(ScanFilter.ORIGINAL.label, null);
+        Button cropBtn = makeHudButton("자동 여백", null);
+
+        Runnable refreshPreview = () -> {
+            Bitmap base = (useCrop[0] && autoCropped != null) ? autoCropped : fullBitmap;
+            Bitmap next = applyScanFilter(base, currentFilter[0]);
+            if (rendered[0] != null && !rendered[0].isRecycled()) rendered[0].recycle();
+            rendered[0] = next;
+            previewImg.setImageBitmap(next);
+            styleHudButton(colorBtn, currentFilter[0] == ScanFilter.ENHANCED_COLOR, false);
+            styleHudButton(bwBtn, currentFilter[0] == ScanFilter.BLACK_WHITE, false);
+            styleHudButton(origBtn, currentFilter[0] == ScanFilter.ORIGINAL, false);
+            cropBtn.setText(useCrop[0] ? "자동 자르기" : "전체 화면");
+            styleHudButton(cropBtn, useCrop[0], false);
+        };
+
+        colorBtn.setOnClickListener(v -> { currentFilter[0] = ScanFilter.ENHANCED_COLOR; refreshPreview.run(); });
+        bwBtn.setOnClickListener(v -> { currentFilter[0] = ScanFilter.BLACK_WHITE; refreshPreview.run(); });
+        origBtn.setOnClickListener(v -> { currentFilter[0] = ScanFilter.ORIGINAL; refreshPreview.run(); });
+        cropBtn.setOnClickListener(v -> { useCrop[0] = !useCrop[0]; refreshPreview.run(); });
+
+        addControlWithGap(filterRow, colorBtn, true);
+        addControlWithGap(filterRow, bwBtn, true);
+        addControlWithGap(filterRow, origBtn, autoCropped != null);
+        if (autoCropped != null) {
+            addControlWithGap(filterRow, cropBtn, false);
+        }
+        container.addView(filterRow);
+
+        refreshPreview.run();
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("문서 스캔 미리보기 (PDF 누적: " + pdfPages.size() + "장)")
+                .setView(container)
+                .setPositiveButton("PDF 내보내기 (" + (pdfPages.size() + 1) + "장)", (d, w) -> {
+                    Bitmap pageCopy = rendered[0] != null ? rendered[0].copy(Bitmap.Config.ARGB_8888, false) : null;
+                    exportPdfBatch(pageCopy);
+                })
+                .setNeutralButton("PDF에 추가", (d, w) -> {
+                    if (rendered[0] != null) {
+                        pdfPages.add(rendered[0].copy(Bitmap.Config.ARGB_8888, false));
+                        updatePdfBadge();
+                        Toast.makeText(this, "📄 PDF 묶음에 추가됨 (총 " + pdfPages.size() + "장)", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("갤러리 저장", (d, w) -> {
+                    if (rendered[0] != null) {
+                        boolean ok = saveBitmapToGallery(rendered[0], "UVC_Scan");
+                        Toast.makeText(this, ok ? "📄 스캔 이미지가 갤러리에 저장되었습니다" : "저장 실패", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .create();
+
+        dialog.setOnDismissListener(d -> {
+            if (rendered[0] != null && !rendered[0].isRecycled()) rendered[0].recycle();
+            if (autoCropped != null && !autoCropped.isRecycled()) autoCropped.recycle();
+            if (!fullBitmap.isRecycled()) fullBitmap.recycle();
+        });
+        dialog.show();
+    }
+
+    private void updatePdfBadge() {
+        mainHandler.post(() -> {
+            if (pdfPages.isEmpty()) {
+                pdfBadgeBtn.setVisibility(View.GONE);
+            } else {
+                pdfBadgeBtn.setText("PDF " + pdfPages.size() + "장");
+                pdfBadgeBtn.setVisibility(View.VISIBLE);
+            }
+        });
+    }
+
+    private void exportPdfBatch(Bitmap extraLastPage) {
+        if (extraLastPage != null) {
+            pdfPages.add(extraLastPage);
+        }
+        if (pdfPages.isEmpty()) {
+            Toast.makeText(this, "PDF로 내보낼 페이지가 없습니다", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        PdfDocument doc = new PdfDocument();
+        for (int i = 0; i < pdfPages.size(); i++) {
+            Bitmap pageBmp = pdfPages.get(i);
+            if (pageBmp == null || pageBmp.isRecycled()) continue;
+            PdfDocument.PageInfo info = new PdfDocument.PageInfo.Builder(
+                    pageBmp.getWidth(),
+                    pageBmp.getHeight(),
+                    i + 1
+            ).create();
+            PdfDocument.Page page = doc.startPage(info);
+            page.getCanvas().drawBitmap(pageBmp, 0, 0, null);
+            doc.finishPage(page);
+        }
+
+        String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+        String fileName = "UVC_Scan_" + ts + ".pdf";
+        File cacheFile = new File(getCacheDir(), fileName);
+
+        try (FileOutputStream fos = new FileOutputStream(cacheFile)) {
+            doc.writeTo(fos);
+        } catch (Exception e) {
+            doc.close();
+            Toast.makeText(this, "PDF 생성 실패: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        // Also save a copy into Downloads/UVC Cam on Android 10+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContentValues cv = new ContentValues();
+            cv.put(MediaStore.Downloads.DISPLAY_NAME, fileName);
+            cv.put(MediaStore.Downloads.MIME_TYPE, "application/pdf");
+            cv.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/UVC Cam");
+            cv.put(MediaStore.Downloads.IS_PENDING, 1);
+            ContentResolver resolver = getContentResolver();
+            Uri dlUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+            if (dlUri != null) {
+                try (OutputStream os = resolver.openOutputStream(dlUri)) {
+                    if (os != null) doc.writeTo(os);
+                    cv.clear();
+                    cv.put(MediaStore.Downloads.IS_PENDING, 0);
+                    resolver.update(dlUri, cv, null, null);
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        doc.close();
+
+        for (Bitmap page : pdfPages) {
+            if (page != null && !page.isRecycled()) page.recycle();
+        }
+        pdfPages.clear();
+        updatePdfBadge();
+
+        Uri shareUri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", cacheFile);
+        Intent shareIntent = new Intent(Intent.ACTION_SEND);
+        shareIntent.setType("application/pdf");
+        shareIntent.putExtra(Intent.EXTRA_STREAM, shareUri);
+        shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        Toast.makeText(this, "📄 Downloads/UVC Cam 저장 및 공유 시트 열기", Toast.LENGTH_SHORT).show();
+        startActivity(Intent.createChooser(shareIntent, "PDF 공유 / 저장"));
+    }
+
+    private boolean saveBitmapToGallery(Bitmap bitmap, String prefix) {
+        String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+        String name = prefix + "_" + ts + ".jpg";
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.Images.Media.DISPLAY_NAME, name);
+        values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/UVC Cam");
+            values.put(MediaStore.Images.Media.IS_PENDING, 1);
+        }
+
+        ContentResolver resolver = getContentResolver();
+        Uri uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+        if (uri == null) return false;
+
+        try (OutputStream out = resolver.openOutputStream(uri)) {
+            if (out == null) return false;
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 94, out);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                values.clear();
+                values.put(MediaStore.Images.Media.IS_PENDING, 0);
+                resolver.update(uri, values, null, null);
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // MARK: - Helpers & Camera Control
 
     private void addControlWithGap(LinearLayout parent, View child, boolean withMargin) {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -503,7 +1016,9 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         b.setMinimumHeight(dp(36));
         b.setMinWidth(0);
         b.setMinimumWidth(0);
-        b.setOnClickListener(listener);
+        if (listener != null) {
+            b.setOnClickListener(listener);
+        }
         styleHudButton(b, false, false);
         return b;
     }
